@@ -19,12 +19,17 @@ def convert_to_meters(row: pd.Series) -> float:
     if unit == "M":
         return row["quantity"]
 
-    if unit in ("M2", "PCS"):
-        # M2 and PCS are the same thing (en x boy / width x length):
-        # divide by width to recover the length in meters.
+    if unit =="M2":
         if pd.isna(row["width_m"]) or row["width_m"] == 0:
             raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
         return row["quantity"] / row["width_m"]
+
+    if unit =="PCS":
+            if pd.isna(row["length_m"]) or pd.isna(row["length_m"]) == 0:
+                raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
+            return row["quantity"] * row["length_m"]
+
+    
 
     raise ValueError(f"{row['order_id']}: unknown unit '{unit}'")
 
