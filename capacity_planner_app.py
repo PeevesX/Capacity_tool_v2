@@ -1,170 +1,329 @@
-"""
-Shared capacity-planning logic for carding lines TRK0001 / TRK0002 (or more).
-Both the CLI script and the Streamlit app import from here.
-"""
-
+import io
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
 
-REQUIRED_ORDER_COLS = [
-    "order_id", "product", "line", "month", "unit",
-    "quantity", "width_m", "length_m", "cycle_time_sec_per_m",
-]
-REQUIRED_CALENDAR_COLS = ["line", "month", "working_days", "hours_per_day"]
+from planner_core import (
+    HOLDOUT_GROUP_LABELS,
+    REQUIRED_CALENDAR_COLS,
+    REQUIRED_ORDER_COLS,
+    build_holdout_summary,
+    build_monthly_summary,
+    compute_annual_capacity_from_calendar,
+    process_holdout_orders,
+    process_orders,
+    validate_columns,
+)
 
+st.set_page_config(page_title="Tarak Hattı Fizibilite Planlayıcı", layout="wide")
 
-def convert_to_meters(row: pd.Series) -> float:
-    """Turn one order's quantity into linear meters, based on unit."""
-    unit = row["unit"]
-
-    if unit == "M":
-        return row["quantity"]
-
-    if unit == "M2":
-        if pd.isna(row["width_m"]) or row["width_m"] == 0:
-            raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
-        return row["quantity"] / row["width_m"]
-
-    if unit == "PCS":
-        if pd.isna(row["length_m"]) or row["length_m"] == 0:
-            raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
-        return row["quantity"] * row["length_m"]
-
-    raise ValueError(f"{row['order_id']}: unknown unit '{unit}'")
+# Header Section
+col1, col2 = st.columns([1, 5], vertical_alignment="center")
+with col1:
+    st.image("ototeks_logo.svg", width=180)
+with col2:
+    st.title("Tarak Hattı Fizibilite Planlayıcı")
 
 
-def compute_required_hours(row: pd.Series) -> float:
-    """Ideal production time required for the order (without OEE)."""
-    return (row["meters"] * row["cycle_time_sec_per_m"]) / 3600
+# ---------- Caching ----------
+@st.cache_data(show_spinner=False)
+def read_any(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    return pd.read_excel(uploaded_file)
 
 
-def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
-    """Add meters + required_hours columns to a raw orders dataframe."""
-    orders = orders.copy()
-    orders["meters"] = orders.apply(convert_to_meters, axis=1)
-    orders["required_hours"] = orders.apply(compute_required_hours, axis=1)
-    return orders
+@st.cache_data(show_spinner=False)
+def get_processed_line_data(orders_df: pd.DataFrame, calendar_df: pd.DataFrame, oee_by_line: dict):
+    processed = process_orders(orders_df)
+    summary = build_monthly_summary(processed, calendar_df, oee_by_line)
+    return processed, summary
 
 
-def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
-    """One row per (line, month): effective capacity (scaled by OEE) vs. required hours vs. utilization %."""
-    calendar = calendar.copy()
+# ---------- Sidebar: Inputs ----------
+st.sidebar.header("1. Dosya Yükle")
+calendar_file = st.sidebar.file_uploader(
+    "Takvim (hat, ay, çalışma_günleri, günlük_çalışma_saati)",
+    type=["xlsx", "csv"],
+)
+orders_file = st.sidebar.file_uploader(
+    "Siparişler (sipariş no, ürün, hat, ay, birim, miktar, genişlik(m), uzunluk(m), metre_başına_çevrim_süresi(sn))",
+    type=["xlsx", "csv"],
+)
 
-    # Apply OEE directly to gross capacity
-    calendar["oee"] = calendar["line"].map(oee_by_line)
-    if calendar["oee"].isna().any():
-        missing_lines = calendar[calendar["oee"].isna()]["line"].unique()
-        raise ValueError(f"Missing OEE value for line(s): {missing_lines}")
+st.sidebar.header("2. Hat OEE Değerlerini Girin")
+st.sidebar.caption("Algılanan hatlar için OEE değerleri dosyadan otomatik olarak doldurulur.")
 
-    calendar["gross_capacity_hours"] = calendar["working_days"] * calendar["hours_per_day"]
-    calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
+if not calendar_file or not orders_file:
+    st.info("Başlamak için takvim ve sipariş dosyalarını sol sütundaki uygun yerlere yükleyin.")
+    st.stop()
 
-    demand = (
-        orders.groupby(["line", "month"])["required_hours"]
-        .sum()
-        .reset_index()
+try:
+    calendar_df = read_any(calendar_file)
+    orders_df = read_any(orders_file)
+    validate_columns(calendar_df, REQUIRED_CALENDAR_COLS, "Calendar file")
+    validate_columns(orders_df, REQUIRED_ORDER_COLS, "Orders file")
+except Exception as e:
+    st.error(f"Dosya okunurken hata oluştu: {e}")
+    st.stop()
+
+lines = sorted(orders_df["line"].dropna().unique())
+if not lines:
+    st.error("Sipariş dosyasında 'hat' sütununda değer bulunamadı.")
+    st.stop()
+
+oee_by_line = {}
+for line in lines:
+    oee_by_line[line] = st.sidebar.number_input(
+        f"OEE — {line}", min_value=0.01, max_value=1.0, value=0.78, step=0.01, key=f"oee_{line}"
     )
-    summary = calendar.merge(demand, on=["line", "month"], how="left")
-    summary["required_hours"] = summary["required_hours"].fillna(0)
-    summary["utilization_pct"] = (
-        summary["required_hours"] / summary["capacity_hours"] * 100
+
+# ---------- Sidebar: 3. Kapasite Holdout ----------
+st.sidebar.markdown("---")
+st.sidebar.header("3. Kapasite Holdout")
+holdout_file = st.sidebar.file_uploader(
+    "Holdout siparişleri (holdout_orders_template.xlsx formatında)",
+    type=["xlsx", "csv"],
+)
+holdout_oee = st.sidebar.number_input(
+    "Holdout OEE", min_value=0.01, max_value=1.0, value=0.78, step=0.01, key="holdout_oee"
+)
+
+# ---------- Data Preview ----------
+with st.expander("Önizleme: Takvim ve Siparişler"):
+    c1, c2 = st.columns(2)
+    c1.write("**Calendar**")
+    c1.dataframe(calendar_df, use_container_width=True)
+    c2.write("**Orders**")
+    c2.dataframe(orders_df, use_container_width=True)
+
+try:
+    processed_orders, summary = get_processed_line_data(orders_df, calendar_df, oee_by_line)
+except Exception as e:
+    st.error(f"Hesaplama hatası: {e}")
+    st.stop()
+
+# Build Total Aggregated Summary across all lines per month
+total_summary = (
+    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours"]]
+    .sum()
+)
+total_summary["utilization_pct"] = (
+    total_summary["required_hours"] / total_summary["capacity_hours"] * 100
+)
+
+# ---------- Dynamic Tab Generation ----------
+tab_names = ["Tüm Hatlar (Toplam)"] + list(lines) + ["Kapasite Holdout"]
+tabs = st.tabs(tab_names)
+
+# Render Combined Tab (All Lines)
+with tabs[0]:
+    st.subheader("Tüm Hatlar — Toplam Aylık Özet")
+    col_table, col_chart = st.columns([2.5, 2])
+
+    with col_table:
+        total_summary_tr = total_summary.rename(columns={
+            "month": "Ay",
+            "capacity_hours": "Toplam Kapasite Saatleri",
+            "required_hours": "Toplam Gereken Süre",
+            "utilization_pct": "Ortalama Doluluk %",
+        })
+        st.dataframe(
+            total_summary_tr[
+                ["Ay", "Toplam Kapasite Saatleri", "Toplam Gereken Süre", "Ortalama Doluluk %"]
+            ].style.format({
+                "Toplam Kapasite Saatleri": "{:.0f}",
+                "Toplam Gereken Süre": "{:.1f}",
+                "Ortalama Doluluk %": "{:.1f}%",
+            }),
+            use_container_width=True,
+        )
+
+    with col_chart:
+        fig_tot = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_tot.add_trace(
+            go.Bar(x=total_summary["month"], y=total_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#1f77b4"),
+            secondary_y=False,
+        )
+        fig_tot.add_trace(
+            go.Bar(x=total_summary["month"], y=total_summary["required_hours"], name="Gereken (sa)", marker_color="#ff7f0e"),
+            secondary_y=False,
+        )
+        fig_tot.add_trace(
+            go.Scatter(x=total_summary["month"], y=total_summary["utilization_pct"], name="Doluluk %", mode="lines+markers", line=dict(color="black")),
+            secondary_y=True,
+        )
+        fig_tot.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
+        fig_tot.update_layout(
+            title_text="Tüm Hatlar Toplamı: Kapasite vs Gereken Süre",
+            barmode="group",
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_tot.update_xaxes(type="category", tickmode="linear")
+        fig_tot.update_yaxes(title_text="Saatler", secondary_y=False)
+        fig_tot.update_yaxes(title_text="Doluluk %", secondary_y=True)
+        st.plotly_chart(fig_tot, use_container_width=True)
+
+    csv_bytes_tot = total_summary.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Tüm hatlar özetini CSV olarak indir",
+        data=csv_bytes_tot,
+        file_name="tum_hatlar_toplam_ozet.csv",
+        mime="text/csv",
+        key="dl_total",
     )
-    return summary.sort_values(["line", "month"]).reset_index(drop=True)
 
+# Render individual Line tabs (TRK0001, TRK0002 etc.)
+for tab, line in zip(tabs[1:-1], lines):
+    with tab:
+        line_summary = summary[summary["line"] == line].reset_index(drop=True)
+        st.subheader(f"{line} — Aylık Özet")
 
-def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{label} is missing columns: {missing}")
+        col_table, col_chart = st.columns([2.5, 2])
 
+        with col_table:
+            line_summary_tr = line_summary.rename(columns={
+                "month": "Ay",
+                "working_days": "Çalışma Günleri",
+                "hours_per_day": "Günlük Çalışma Saati",
+                "capacity_hours": "Kapasite Saatleri",
+                "required_hours": "Gereken Süre",
+                "utilization_pct": "Doluluk %",
+            })
+            st.dataframe(
+                line_summary_tr[
+                    ["Ay", "Çalışma Günleri", "Günlük Çalışma Saati", "Kapasite Saatleri", "Gereken Süre", "Doluluk %"]
+                ].style.format({
+                    "Kapasite Saatleri": "{:.0f}",
+                    "Gereken Süre": "{:.1f}",
+                    "Doluluk %": "{:.1f}%",
+                }),
+                use_container_width=True,
+            )
 
-# ---------------------------------------------------------------------------
-# Capacity holdout logic
-# ---------------------------------------------------------------------------
+        with col_chart:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(
+                go.Bar(x=line_summary["month"], y=line_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#4C72B0"),
+                secondary_y=False,
+            )
+            fig.add_trace(
+                go.Bar(x=line_summary["month"], y=line_summary["required_hours"], name="Gereken (sa)", marker_color="#DD8452"),
+                secondary_y=False,
+            )
+            fig.add_trace(
+                go.Scatter(x=line_summary["month"], y=line_summary["utilization_pct"], name="Doluluk %", mode="lines+markers", line=dict(color="black")),
+                secondary_y=True,
+            )
+            fig.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
+            fig.update_layout(
+                title_text=f"{line}: Kapasite vs Gereken Süre",
+                barmode="group",
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            fig.update_xaxes(type="category", tickmode="linear")
+            fig.update_yaxes(title_text="Saatler", secondary_y=False)
+            fig.update_yaxes(title_text="Doluluk %", secondary_y=True)
+            st.plotly_chart(fig, use_container_width=True)
 
-REQUIRED_HOLDOUT_COLS = [
-    "order_id", "customer_plant", "internal_external", "model_key",
-    "program_carline", "unit", "cycle_time_sec_per_unit",
-]
-HOLDOUT_YEAR_COLS = [f"vol_{y}" for y in range(2026, 2032)] + [str(y) for y in range(2026, 2032)] + list(range(2026, 2032))
-HOLDOUT_GROUP_LABELS = {
-    "total": "Toplam (Genel Özet)",
-    "customer_plant": "Company",
-    "internal_external": "Internal / External",
-    "model_key": "Customer / Model-Key",
-    "program_carline": "Program / Carline",
-}
+        csv_bytes = line_summary.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"Download {line} summary as CSV",
+            data=csv_bytes,
+            file_name=f"{line}_monthly_summary.csv",
+            mime="text/csv",
+            key=f"dl_{line}",
+        )
 
-
-def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """
-    Pivot to: rows = year, columns = group_col values, cells = required_hours.
-    """
-    grouped = long_df.copy()
-
-    if group_col == "total":
-        pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre")
-        return pivot.sort_index()
-
-    if group_col not in grouped.columns:
-        raise ValueError(f"Unknown grouping column: {group_col}")
-
-    grouped[group_col] = grouped[group_col].fillna("Unspecified")
-
-    pivot = grouped.pivot_table(
-        index="year",
-        columns=group_col,
-        values="required_hours",
-        aggfunc="sum",
-        fill_value=0,
-    )
-    return pivot.sort_index()
-
-
-def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
-    """
-    Reshape wide holdout orders into long format and compute required_hours.
-    """
-    orders = orders.copy()
-    # Standardize column headers to string
-    orders.columns = [str(c) for c in orders.columns]
-
-    year_cols = [c for c in orders.columns if c.startswith("vol_") or c in [str(y) for y in range(2026, 2032)]]
-    if not year_cols:
-        raise ValueError(f"No year volume columns found in file.")
-
-    id_cols = [c for c in orders.columns if c not in year_cols]
-    long_df = orders.melt(id_vars=id_cols, value_vars=year_cols,
-                           var_name="year", value_name="volume")
-    long_df["year"] = long_df["year"].astype(str).str.replace("vol_", "", regex=False)
-    long_df["volume"] = pd.to_numeric(long_df["volume"], errors="coerce").fillna(0)
-
-    ideal_hours = (long_df["volume"] * long_df["cycle_time_sec_per_unit"]) / 3600
-
-    if isinstance(oee, dict):
-        if "line" not in long_df.columns:
-            # If no line column present, fallback to average of oee_by_line
-            avg_oee = sum(oee.values()) / len(oee) if oee else 0.78
-            long_df["required_hours"] = ideal_hours / avg_oee
-        else:
-            missing = set(long_df["line"].dropna().unique()) - set(oee.keys())
-            if missing:
-                raise ValueError(f"No OEE set for line(s): {sorted(missing)}")
-            long_df["required_hours"] = ideal_hours / long_df["line"].map(oee)
+# Render the Kapasite Holdout Tab
+# ---------- Render the Kapasite Holdout Tab ----------
+with tabs[-1]:
+    st.subheader("Müşteri Bazında Kapasite Analizi")
+    if not holdout_file:
+        st.info("Kapasite dosyasını sol menüden yükleyin.")
     else:
-        long_df["required_hours"] = ideal_hours / oee
+        holdout_raw = read_any(holdout_file)
+        try:
+            if "line" in holdout_raw.columns and holdout_raw["line"].notna().any():
+                long_df = process_holdout_orders(holdout_raw, oee_by_line)
+            else:
+                long_df = process_holdout_orders(holdout_raw, holdout_oee)
+        except Exception as e:
+            st.error(f"Hesaplama hatası: {e}")
+            st.stop()
 
-    return long_df
+        group_col = st.selectbox(
+            "Gruplama",
+            options=list(HOLDOUT_GROUP_LABELS.keys()),
+            format_func=lambda c: HOLDOUT_GROUP_LABELS[c],
+            key="holdout_group_select",
+        )
+        pivot = build_holdout_summary(long_df, group_col)
 
+        col_table, col_chart = st.columns([2, 3])
 
-def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
-    """
-    Computes total annual net capacity hours per line aggregated across all months.
-    """
-    df = calendar_df.copy()
-    df["oee"] = df["line"].map(oee_by_line)
-    df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
+        with col_table:
+            st.dataframe(pivot.style.format("{:,.0f}"), use_container_width=True)
 
-    annual_total = df["capacity_hours"].sum()
-    
-    # Returns annual capacity mapped to all holdout years (2026-2031)
-    return {str(y): annual_total for y in range(2026, 2032)}
+        with col_chart:
+            years_str = [str(y) for y in pivot.index.tolist()]
+            capacity_dict = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
+
+            fig_holdout = go.Figure()
+
+            # 1. Bar Grafiği (Gereken Saatler)
+            yearly_totals = pivot.sum(axis=1)
+            pivot_pct = pivot.div(yearly_totals, axis=0) * 100
+
+            for col in pivot.columns:
+                hover_text = [
+                    f"<b>{col}</b><br>Yıl: {year}<br>Gereken Süre: {val:,.1f} sa<br>Payı: %{pct:.1f}"
+                    for year, val, pct in zip(years_str, pivot[col], pivot_pct[col])
+                ]
+                fig_holdout.add_trace(go.Bar(
+                    x=years_str,
+                    y=pivot[col],
+                    name=str(col),
+                    hoverinfo="text",
+                    hovertext=hover_text
+                ))
+
+            # 2. Maksimum Yıllık Kapasite Çizgisi (Güvenli Lookup)
+            cap_values = [
+                capacity_dict.get(y, capacity_dict.get("default", 0))
+                for y in years_str
+            ]
+
+            fig_holdout.add_trace(go.Scatter(
+                x=years_str,
+                y=cap_values,
+                mode="lines+markers",
+                name="Maks. Yıllık Kapasite",
+                line=dict(color="red", width=3, dash="dash"),
+                hoverinfo="text",
+                hovertext=[f"Maks. Kapasite ({y}): {c:,.0f} sa" for y, c in zip(years_str, cap_values)],
+            ))
+
+            fig_holdout.update_layout(
+                barmode="stack",
+                title_text=f"Kapasite Holdout — {HOLDOUT_GROUP_LABELS[group_col]}",
+                xaxis_title="Yıl",
+                yaxis_title="Süre (Saat)",
+                margin=dict(l=20, r=20, t=40, b=20),
+                legend=dict(orientation="h", y=-0.2, xanchor="center", x=0.5),
+            )
+            fig_holdout.update_xaxes(type="category", tickmode="linear")
+            st.plotly_chart(fig_holdout, use_container_width=True)
+
+        csv_bytes = pivot.to_csv().encode("utf-8")
+        st.download_button(
+            "Holdout özetini indir",
+            data=csv_bytes,
+            file_name="kapasite_holdout.csv",
+            mime="text/csv",
+            key="dl_holdout",
+        )

@@ -85,7 +85,7 @@ REQUIRED_HOLDOUT_COLS = [
     "order_id", "customer_plant", "internal_external", "model_key",
     "program_carline", "unit", "cycle_time_sec_per_unit",
 ]
-HOLDOUT_YEAR_COLS = [f"vol_{y}" for y in range(2026, 2032)]
+HOLDOUT_YEAR_COLS = [f"vol_{y}" for y in range(2026, 2032)] + [str(y) for y in range(2026, 2032)] + list(range(2026, 2032))
 HOLDOUT_GROUP_LABELS = {
     "total": "Toplam (Genel Özet)",
     "customer_plant": "Company",
@@ -101,12 +101,10 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     """
     grouped = long_df.copy()
 
-    # 1. ÖNCE 'total' kontrolü (Sütun doğrulamasından ÖNCE olmalı)
     if group_col == "total":
         pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre")
         return pivot.sort_index()
 
-    # 2. 'total' değilse sütun var mı diye bak
     if group_col not in grouped.columns:
         raise ValueError(f"Unknown grouping column: {group_col}")
 
@@ -125,29 +123,33 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
 def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
     """
     Reshape wide holdout orders into long format and compute required_hours.
-    `oee` can be a single float (applied to every row) or a dict of
-    {line: oee} — in which case `orders` must have a 'line' column, and
-    each row is inflated by its own line's OEE.
     """
-    year_cols = [c for c in HOLDOUT_YEAR_COLS if c in orders.columns]
+    orders = orders.copy()
+    # Standardize column headers to string
+    orders.columns = [str(c) for c in orders.columns]
+
+    year_cols = [c for c in orders.columns if c.startswith("vol_") or c in [str(y) for y in range(2026, 2032)]]
     if not year_cols:
-        raise ValueError(f"No year volume columns found (expected some of {HOLDOUT_YEAR_COLS})")
+        raise ValueError(f"No year volume columns found in file.")
 
     id_cols = [c for c in orders.columns if c not in year_cols]
     long_df = orders.melt(id_vars=id_cols, value_vars=year_cols,
                            var_name="year", value_name="volume")
-    long_df["year"] = long_df["year"].str.replace("vol_", "", regex=False)
-    long_df["volume"] = long_df["volume"].fillna(0)
+    long_df["year"] = long_df["year"].astype(str).str.replace("vol_", "", regex=False)
+    long_df["volume"] = pd.to_numeric(long_df["volume"], errors="coerce").fillna(0)
 
     ideal_hours = (long_df["volume"] * long_df["cycle_time_sec_per_unit"]) / 3600
 
     if isinstance(oee, dict):
         if "line" not in long_df.columns:
-            raise ValueError("oee is a per-line dict but orders have no 'line' column")
-        missing = set(long_df["line"].dropna().unique()) - set(oee.keys())
-        if missing:
-            raise ValueError(f"No OEE set for line(s): {sorted(missing)}")
-        long_df["required_hours"] = ideal_hours / long_df["line"].map(oee)
+            # If no line column present, fallback to average of oee_by_line
+            avg_oee = sum(oee.values()) / len(oee) if oee else 0.78
+            long_df["required_hours"] = ideal_hours / avg_oee
+        else:
+            missing = set(long_df["line"].dropna().unique()) - set(oee.keys())
+            if missing:
+                raise ValueError(f"No OEE set for line(s): {sorted(missing)}")
+            long_df["required_hours"] = ideal_hours / long_df["line"].map(oee)
     else:
         long_df["required_hours"] = ideal_hours / oee
 
@@ -156,22 +158,13 @@ def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
 
 def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
     """
-    Takvimdeki verileri kullanarak yıllık toplam net kapasiteyi (saat) hesaplar.
+    Computes total annual net capacity hours per line aggregated across all months.
     """
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
 
-    year_col = None
-    for col in df.columns:
-        if str(col).lower() in ["year", "yıl", "yil"]:
-            year_col = col
-            break
-
-    if year_col:
-        annual_cap = df.groupby(year_col)["capacity_hours"].sum().to_dict()
-        return {str(k): v for k, v in annual_cap.items()}
-    else:
-        # Tek yıllık takvim yüklendiyse toplam kapasiteyi 'default' olarak döner
-        total_annual_hours = df["capacity_hours"].sum()
-        return {"default": total_annual_hours}
+    annual_total = df["capacity_hours"].sum()
+    
+    # Returns annual capacity mapped to all holdout years (2026-2031)
+    return {str(y): annual_total for y in range(2026, 2032)}
