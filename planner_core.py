@@ -25,7 +25,7 @@ def convert_to_meters(row: pd.Series) -> float:
         return row["quantity"] / row["width_m"]
 
     if unit =="PCS":
-            if pd.isna(row["length_m"]) or pd.isna(row["length_m"]) == 0:
+            if pd.isna(row["length_m"]) or row["length_m"] == 0:
                 raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
             return row["quantity"] * row["length_m"]
 
