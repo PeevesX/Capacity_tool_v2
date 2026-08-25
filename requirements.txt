@@ -2,10 +2,4 @@ pandas
 matplotlib
 streamlit
 openpyxl
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
 plotly
-=======
->>>>>>> e0fa1ed (Added Holdouts, and chart updates)
->>>>>>> 946fc96 (Added Holdouts, and chart updates)
