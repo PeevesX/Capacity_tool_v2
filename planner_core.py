@@ -19,17 +19,15 @@ def convert_to_meters(row: pd.Series) -> float:
     if unit == "M":
         return row["quantity"]
 
-    if unit =="M2":
+    if unit == "M2":
         if pd.isna(row["width_m"]) or row["width_m"] == 0:
             raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
         return row["quantity"] / row["width_m"]
 
-    if unit =="PCS":
-            if pd.isna(row["length_m"]) or row["length_m"] == 0:
-                raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
-            return row["quantity"] * row["length_m"]
-
-    
+    if unit == "PCS":
+        if pd.isna(row["length_m"]) or row["length_m"] == 0:
+            raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
+        return row["quantity"] * row["length_m"]
 
     raise ValueError(f"{row['order_id']}: unknown unit '{unit}'")
 
@@ -103,12 +101,12 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     """
     grouped = long_df.copy()
 
-    # 1. ÖNCE 'total' kontrolünü yap (Sütun kontrolünden ÖNCE gelmeli!)
+    # 1. ÖNCE 'total' kontrolü (Sütun doğrulamasından ÖNCE olmalı)
     if group_col == "total":
         pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre")
         return pivot.sort_index()
 
-    # 2. 'total' değilse DataFrame sütunlarında var mı diye kontrol et
+    # 2. 'total' değilse sütun var mı diye bak
     if group_col not in grouped.columns:
         raise ValueError(f"Unknown grouping column: {group_col}")
 
@@ -154,23 +152,6 @@ def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
         long_df["required_hours"] = ideal_hours / oee
 
     return long_df
-
-
-def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """
-    Pivot to: rows = year, columns = group_col values, cells = required_hours.
-    """
-    if group_col not in long_df.columns:
-        raise ValueError(f"Unknown grouping column: {group_col}")
-
-    grouped = long_df.copy()
-    grouped[group_col] = grouped[group_col].fillna("Unspecified")
-
-    pivot = grouped.pivot_table(
-        index="year", columns=group_col, values="required_hours",
-        aggfunc="sum", fill_value=0,
-    )
-    return pivot.sort_index()
 
 
 def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
