@@ -103,13 +103,13 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     """
     grouped = long_df.copy()
 
-    # 'total' seçildiğinde sütun aramak yerine doğrudan yıl bazlı toplam al
+    # 1. ÖNCE 'total' kontrolünü yap (Sütun kontrolünden ÖNCE gelmeli!)
     if group_col == "total":
         pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre")
         return pivot.sort_index()
 
-    # Sütun kontrolü
-    if group_col not in long_df.columns:
+    # 2. 'total' değilse DataFrame sütunlarında var mı diye kontrol et
+    if group_col not in grouped.columns:
         raise ValueError(f"Unknown grouping column: {group_col}")
 
     grouped[group_col] = grouped[group_col].fillna("Unspecified")
