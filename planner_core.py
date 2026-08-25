@@ -168,14 +168,24 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     return pivot.sort_index()
 
 
-def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
-    """Returns (line, year, capacity_hours), built from the calendar's
-    'month' column (e.g. '2027-01') — no separate 'year' column needed."""
+def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
+    """
+    Takvimdeki verileri kullanarak yıllık toplam net kapasiteyi (saat) hesaplar.
+    """
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
-    if df["oee"].isna().any():
-        missing = df[df["oee"].isna()]["line"].unique()
-        raise ValueError(f"Missing OEE for line(s): {missing}")
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
-    df["year"] = df["month"].astype(str).str.slice(0, 4)
-    return df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
+
+    year_col = None
+    for col in df.columns:
+        if str(col).lower() in ["year", "yıl", "yil"]:
+            year_col = col
+            break
+
+    if year_col:
+        annual_cap = df.groupby(year_col)["capacity_hours"].sum().to_dict()
+        return {str(k): v for k, v in annual_cap.items()}
+    else:
+        # Tek yıllık takvim yüklendiyse toplam kapasiteyi 'default' olarak döner
+        total_annual_hours = df["capacity_hours"].sum()
+        return {"default": total_annual_hours}

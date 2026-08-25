@@ -292,17 +292,11 @@ with tabs[-1]:
                     hovertext=hover_text
                 ))
 
-            # 2. Maksimum Yıllık Kapasite Çizgisi
-            # Eğer takvimde yıla göre kapasite varsa yıla göre, yoksa toplam sabit kapasiteyi çizer
-            cap_values = []
-            for y in years_str:
-                if y in capacity_dict:
-                    cap_values.append(capacity_dict[y])
-                elif "default" in capacity_dict:
-                    cap_values.append(capacity_dict["default"])
-                else:
-                    # Yıl bazı eşleşmiyorsa toplam kapasiteyi al
-                    cap_values.append(sum(capacity_dict.values()))
+            # 2. Maksimum Yıllık Kapasite Çizgisi (Güvenli Lookup)
+            cap_values = [
+                capacity_dict.get(y, capacity_dict.get("default", 0))
+                for y in years_str
+            ]
 
             fig_holdout.add_trace(go.Scatter(
                 x=years_str,
