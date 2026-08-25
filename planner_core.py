@@ -19,15 +19,12 @@ def convert_to_meters(row: pd.Series) -> float:
     if unit == "M":
         return row["quantity"]
 
-    if unit == "M2":
+    if unit in ("M2", "PCS"):
+        # M2 and PCS are the same thing (en x boy / width x length):
+        # divide by width to recover the length in meters.
         if pd.isna(row["width_m"]) or row["width_m"] == 0:
-            raise ValueError(f"{row['order_id']}: M2 order needs width_m")
+            raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
         return row["quantity"] / row["width_m"]
-
-    if unit == "PCS":
-        if pd.isna(row["length_m"]) or row["length_m"] == 0:
-            raise ValueError(f"{row['order_id']}: PCS order needs length_m")
-        return row["quantity"] * row["length_m"]
 
     raise ValueError(f"{row['order_id']}: unknown unit '{unit}'")
 
@@ -48,7 +45,7 @@ def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
 def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
     """One row per (line, month): effective capacity (scaled by OEE) vs. required hours vs. utilization %."""
     calendar = calendar.copy()
-    
+
     # Apply OEE directly to gross capacity
     calendar["oee"] = calendar["line"].map(oee_by_line)
     if calendar["oee"].isna().any():
@@ -94,24 +91,35 @@ HOLDOUT_GROUP_LABELS = {
 }
 
 
-def process_holdout_orders(orders: pd.DataFrame, oee: float = 1.0) -> pd.DataFrame:
+def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
     """
-    Reshape the wide holdout orders into long format and compute required_hours.
+    Reshape wide holdout orders into long format and compute required_hours.
+    `oee` can be a single float (applied to every row) or a dict of
+    {line: oee} — in which case `orders` must have a 'line' column, and
+    each row is inflated by its own line's OEE.
     """
     year_cols = [c for c in HOLDOUT_YEAR_COLS if c in orders.columns]
     if not year_cols:
         raise ValueError(f"No year volume columns found (expected some of {HOLDOUT_YEAR_COLS})")
 
     id_cols = [c for c in orders.columns if c not in year_cols]
-    long_df = orders.melt(
-        id_vars=id_cols, value_vars=year_cols,
-        var_name="year", value_name="volume",
-    )
+    long_df = orders.melt(id_vars=id_cols, value_vars=year_cols,
+                           var_name="year", value_name="volume")
     long_df["year"] = long_df["year"].str.replace("vol_", "", regex=False)
     long_df["volume"] = long_df["volume"].fillna(0)
 
     ideal_hours = (long_df["volume"] * long_df["cycle_time_sec_per_unit"]) / 3600
-    long_df["required_hours"] = ideal_hours / oee
+
+    if isinstance(oee, dict):
+        if "line" not in long_df.columns:
+            raise ValueError("oee is a per-line dict but orders have no 'line' column")
+        missing = set(long_df["line"].dropna().unique()) - set(oee.keys())
+        if missing:
+            raise ValueError(f"No OEE set for line(s): {sorted(missing)}")
+        long_df["required_hours"] = ideal_hours / long_df["line"].map(oee)
+    else:
+        long_df["required_hours"] = ideal_hours / oee
+
     return long_df
 
 
@@ -132,24 +140,14 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     return pivot.sort_index()
 
 
-def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
-    """
-    Takvimdeki verileri kullanarak yıl bazında toplam net kapasiteyi (saat) hesaplar.
-    Eğer takvimde 'year' veya 'yıl' sütunu yoksa, toplam takvim kapasitesini varsayılan olarak döner.
-    """
+def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
+    """Returns (line, year, capacity_hours), built from the calendar's
+    'month' column (e.g. '2027-01') — no separate 'year' column needed."""
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
+    if df["oee"].isna().any():
+        missing = df[df["oee"].isna()]["line"].unique()
+        raise ValueError(f"Missing OEE for line(s): {missing}")
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
-
-    year_col = None
-    for col in df.columns:
-        if str(col).lower() in ["year", "yıl", "yil"]:
-            year_col = col
-            break
-
-    if year_col:
-        annual_cap = df.groupby(year_col)["capacity_hours"].sum().to_dict()
-        return {str(k): v for k, v in annual_cap.items()}
-    else:
-        total_cap = df["capacity_hours"].sum()
-        return {"default": total_cap}
+    df["year"] = df["month"].astype(str).str.slice(0, 4)
+    return df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
