@@ -89,11 +89,34 @@ REQUIRED_HOLDOUT_COLS = [
 ]
 HOLDOUT_YEAR_COLS = [f"vol_{y}" for y in range(2026, 2032)]
 HOLDOUT_GROUP_LABELS = {
+    "total": "Toplam (Genel Özet)",
     "customer_plant": "Company",
     "internal_external": "Internal / External",
     "model_key": "Customer / Model-Key",
     "program_carline": "Program / Carline",
 }
+
+
+def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """
+    Pivot to: rows = year, columns = group_col values, cells = required_hours.
+    """
+    grouped = long_df.copy()
+
+    if group_col == "total":
+        # Tüm veriyi 'Toplam Gereken Süre' adı altında tek sütunda toplar
+        pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre (saat)")
+    else:
+        if group_col not in long_df.columns:
+            raise ValueError(f"Unknown grouping column: {group_col}")
+
+        grouped[group_col] = grouped[group_col].fillna("Unspecified")
+        pivot = grouped.pivot_table(
+            index="year", columns=group_col, values="required_hours",
+            aggfunc="sum", fill_value=0,
+        )
+
+    return pivot.sort_index()
 
 
 def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:

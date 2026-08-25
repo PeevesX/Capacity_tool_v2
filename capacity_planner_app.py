@@ -240,6 +240,7 @@ for tab, line in zip(tabs[1:-1], lines):
         )
 
 # Render the Kapasite Holdout Tab
+# ---------- Render the Kapasite Holdout Tab ----------
 with tabs[-1]:
     st.subheader("Müşteri Bazında Kapasite Analizi")
     if not holdout_file:
@@ -266,55 +267,60 @@ with tabs[-1]:
         col_table, col_chart = st.columns([2, 3])
 
         with col_table:
-            st.dataframe(pivot.style.format("{:.0f}"), use_container_width=True)
+            st.dataframe(pivot.style.format("{:,.0f}"), use_container_width=True)
 
         with col_chart:
             years_str = [str(y) for y in pivot.index.tolist()]
-            capacity_df = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
-
-            yearly_totals = pivot.sum(axis=1)
-            pivot_pct = pivot.div(yearly_totals, axis=0) * 100
+            capacity_dict = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
 
             fig_holdout = go.Figure()
+
+            # 1. Bar Grafiği (Gereken Saatler)
+            yearly_totals = pivot.sum(axis=1)
+            pivot_pct = pivot.div(yearly_totals, axis=0) * 100
 
             for col in pivot.columns:
                 hover_text = [
                     f"<b>{col}</b><br>Yıl: {year}<br>Gereken Süre: {val:,.1f} sa<br>Payı: %{pct:.1f}"
                     for year, val, pct in zip(years_str, pivot[col], pivot_pct[col])
                 ]
-                fig_holdout.add_trace(go.Bar(x=years_str, y=pivot[col], name=str(col),
-                                              hoverinfo="text", hovertext=hover_text))
-
-            if group_col == "line":
-                for line_name in pivot.columns:
-                    line_cap = capacity_df[capacity_df["line"] == line_name].set_index("year")["capacity_hours"]
-                    cap_values = [line_cap.get(y, 0) for y in years_str]
-                    fig_holdout.add_trace(go.Scatter(
-                        x=years_str, y=cap_values, mode="lines+markers",
-                        name=f"Maks. Kapasite — {line_name}",
-                        line=dict(width=3, dash="dash"),
-                        hoverinfo="text",
-                        hovertext=[f"{line_name} Maks. Kapasite ({y}): {c:,.0f} sa"
-                                   for y, c in zip(years_str, cap_values)],
-                    ))
-            else:
-                combined = capacity_df.groupby("year")["capacity_hours"].sum()
-                cap_values = [combined.get(y, 0) for y in years_str]
-                fig_holdout.add_trace(go.Scatter(
-                    x=years_str, y=cap_values, mode="lines+markers",
-                    name="Maks. Yıllık Kapasite (Toplam)",
-                    line=dict(color="black", width=3, dash="dash"),
+                fig_holdout.add_trace(go.Bar(
+                    x=years_str,
+                    y=pivot[col],
+                    name=str(col),
                     hoverinfo="text",
-                    hovertext=[f"Toplam Maks. Kapasite ({y}): {c:,.0f} sa"
-                               for y, c in zip(years_str, cap_values)],
+                    hovertext=hover_text
                 ))
+
+            # 2. Maksimum Yıllık Kapasite Çizgisi
+            # Eğer takvimde yıla göre kapasite varsa yıla göre, yoksa toplam sabit kapasiteyi çizer
+            cap_values = []
+            for y in years_str:
+                if y in capacity_dict:
+                    cap_values.append(capacity_dict[y])
+                elif "default" in capacity_dict:
+                    cap_values.append(capacity_dict["default"])
+                else:
+                    # Yıl bazı eşleşmiyorsa toplam kapasiteyi al
+                    cap_values.append(sum(capacity_dict.values()))
+
+            fig_holdout.add_trace(go.Scatter(
+                x=years_str,
+                y=cap_values,
+                mode="lines+markers",
+                name="Maks. Yıllık Kapasite",
+                line=dict(color="red", width=3, dash="dash"),
+                hoverinfo="text",
+                hovertext=[f"Maks. Kapasite ({y}): {c:,.0f} sa" for y, c in zip(years_str, cap_values)],
+            ))
 
             fig_holdout.update_layout(
                 barmode="stack",
-                title_text=f"Kapasite: {HOLDOUT_GROUP_LABELS[group_col]} Bazında",
-                xaxis_title="Yıl", yaxis_title="Gereken Süre (saat)",
+                title_text=f"Kapasite Holdout — {HOLDOUT_GROUP_LABELS[group_col]}",
+                xaxis_title="Yıl",
+                yaxis_title="Süre (Saat)",
                 margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(title=HOLDOUT_GROUP_LABELS[group_col], orientation="h", y=-0.2),
+                legend=dict(orientation="h", y=-0.2, xanchor="center", x=0.5),
             )
             fig_holdout.update_xaxes(type="category", tickmode="linear")
             st.plotly_chart(fig_holdout, use_container_width=True)
