@@ -105,12 +105,79 @@ except Exception as e:
     st.error(f"Hesaplama hatası: {e}")
     st.stop()
 
+# Build Total Aggregated Summary across all lines per month
+total_summary = (
+    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours"]]
+    .sum()
+)
+total_summary["utilization_pct"] = (
+    total_summary["required_hours"] / total_summary["capacity_hours"] * 100
+)
+
 # ---------- Dynamic Tab Generation ----------
-tab_names = list(lines) + ["Kapasite Holdout"]
+tab_names = ["Tüm Hatlar (Toplam)"] + list(lines) + ["Kapasite Holdout"]
 tabs = st.tabs(tab_names)
 
-# Render individual Line tabs (TRK0001, TRK0002 vb.)
-for tab, line in zip(tabs[:-1], lines):
+# Render Combined Tab (All Lines)
+with tabs[0]:
+    st.subheader("Tüm Hatlar — Toplam Aylık Özet")
+    col_table, col_chart = st.columns([2.5, 2])
+
+    with col_table:
+        total_summary_tr = total_summary.rename(columns={
+            "month": "Ay",
+            "capacity_hours": "Toplam Kapasite Saatleri",
+            "required_hours": "Toplam Gereken Süre",
+            "utilization_pct": "Ortalama Doluluk %",
+        })
+        st.dataframe(
+            total_summary_tr[
+                ["Ay", "Toplam Kapasite Saatleri", "Toplam Gereken Süre", "Ortalama Doluluk %"]
+            ].style.format({
+                "Toplam Kapasite Saatleri": "{:.0f}",
+                "Toplam Gereken Süre": "{:.1f}",
+                "Ortalama Doluluk %": "{:.1f}%",
+            }),
+            use_container_width=True,
+        )
+
+    with col_chart:
+        fig_tot = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_tot.add_trace(
+            go.Bar(x=total_summary["month"], y=total_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#1f77b4"),
+            secondary_y=False,
+        )
+        fig_tot.add_trace(
+            go.Bar(x=total_summary["month"], y=total_summary["required_hours"], name="Gereken (sa)", marker_color="#ff7f0e"),
+            secondary_y=False,
+        )
+        fig_tot.add_trace(
+            go.Scatter(x=total_summary["month"], y=total_summary["utilization_pct"], name="Doluluk %", mode="lines+markers", line=dict(color="black")),
+            secondary_y=True,
+        )
+        fig_tot.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
+        fig_tot.update_layout(
+            title_text="Tüm Hatlar Toplamı: Kapasite vs Gereken Süre",
+            barmode="group",
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_tot.update_xaxes(type="category", tickmode="linear")
+        fig_tot.update_yaxes(title_text="Saatler", secondary_y=False)
+        fig_tot.update_yaxes(title_text="Doluluk %", secondary_y=True)
+        st.plotly_chart(fig_tot, use_container_width=True)
+
+    csv_bytes_tot = total_summary.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Tüm hatlar özetini CSV olarak indir",
+        data=csv_bytes_tot,
+        file_name="tum_hatlar_toplam_ozet.csv",
+        mime="text/csv",
+        key="dl_total",
+    )
+
+# Render individual Line tabs (TRK0001, TRK0002 etc.)
+for tab, line in zip(tabs[1:-1], lines):
     with tab:
         line_summary = summary[summary["line"] == line].reset_index(drop=True)
         st.subheader(f"{line} — Aylık Özet")
@@ -172,7 +239,7 @@ for tab, line in zip(tabs[:-1], lines):
             key=f"dl_{line}",
         )
 
-# ---------- Render the Kapasite Holdout Tab ----------
+# Render the Kapasite Holdout Tab
 with tabs[-1]:
     st.subheader("Müşteri Bazında Kapasite Analizi")
     if not holdout_file:
@@ -219,7 +286,6 @@ with tabs[-1]:
                                               hoverinfo="text", hovertext=hover_text))
 
             if group_col == "line":
-                # one dashed line per physical line, matched to its own bars
                 for line_name in pivot.columns:
                     line_cap = capacity_df[capacity_df["line"] == line_name].set_index("year")["capacity_hours"]
                     cap_values = [line_cap.get(y, 0) for y in years_str]
@@ -232,7 +298,6 @@ with tabs[-1]:
                                    for y, c in zip(years_str, cap_values)],
                     ))
             else:
-                # combined capacity across all lines
                 combined = capacity_df.groupby("year")["capacity_hours"].sum()
                 cap_values = [combined.get(y, 0) for y in years_str]
                 fig_holdout.add_trace(go.Scatter(
