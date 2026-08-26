@@ -1,4 +1,3 @@
-import io
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -7,7 +6,9 @@ import streamlit as st
 from planner_core import (
     HOLDOUT_GROUP_LABELS,
     REQUIRED_CALENDAR_COLS,
+    REQUIRED_HOLDOUT_COLS,
     REQUIRED_ORDER_COLS,
+    append_year_totals,
     build_holdout_summary,
     build_monthly_summary,
     compute_annual_capacity_from_calendar,
@@ -87,17 +88,14 @@ holdout_file = st.sidebar.file_uploader(
     "Holdout siparişleri (holdout_orders_template.xlsx formatında)",
     type=["xlsx", "csv"],
 )
-holdout_oee = st.sidebar.number_input(
-    "Holdout OEE", min_value=0.01, max_value=1.0, value=0.78, step=0.01, key="holdout_oee"
-)
 
 # ---------- Data Preview ----------
 with st.expander("Önizleme: Takvim ve Siparişler"):
     c1, c2 = st.columns(2)
     c1.write("**Calendar**")
-    c1.dataframe(calendar_df, use_container_width=True)
+    c1.dataframe(calendar_df, width="stretch")
     c2.write("**Orders**")
-    c2.dataframe(orders_df, use_container_width=True)
+    c2.dataframe(orders_df, width="stretch")
 
 try:
     processed_orders, summary = get_processed_line_data(orders_df, calendar_df, oee_by_line)
@@ -124,7 +122,10 @@ with tabs[0]:
     col_table, col_chart = st.columns([2.5, 2])
 
     with col_table:
-        total_summary_tr = total_summary.rename(columns={
+        # append_year_totals adds a "2027 Toplam" row summing TRK0001 + TRK0002
+        # combined capacity/required hours for that year, directly below the months.
+        total_summary_with_totals = append_year_totals(total_summary)
+        total_summary_tr = total_summary_with_totals.rename(columns={
             "month": "Ay",
             "capacity_hours": "Toplam Kapasite Saatleri",
             "required_hours": "Toplam Gereken Süre",
@@ -138,10 +139,12 @@ with tabs[0]:
                 "Toplam Gereken Süre": "{:.1f}",
                 "Ortalama Doluluk %": "{:.1f}%",
             }),
-            use_container_width=True,
+            width="stretch",
         )
 
     with col_chart:
+        # chart stays on the plain monthly total_summary — a "2027 Toplam"
+        # column mixed into month labels on the x-axis would look wrong here
         fig_tot = make_subplots(specs=[[{"secondary_y": True}]])
         fig_tot.add_trace(
             go.Bar(x=total_summary["month"], y=total_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#1f77b4"),
@@ -165,7 +168,7 @@ with tabs[0]:
         fig_tot.update_xaxes(type="category", tickmode="linear")
         fig_tot.update_yaxes(title_text="Saatler", secondary_y=False)
         fig_tot.update_yaxes(title_text="Doluluk %", secondary_y=True)
-        st.plotly_chart(fig_tot, use_container_width=True)
+        st.plotly_chart(fig_tot, width="stretch")
 
     csv_bytes_tot = total_summary.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -180,12 +183,13 @@ with tabs[0]:
 for tab, line in zip(tabs[1:-1], lines):
     with tab:
         line_summary = summary[summary["line"] == line].reset_index(drop=True)
+        line_summary_with_totals = append_year_totals(line_summary)
         st.subheader(f"{line} — Aylık Özet")
 
         col_table, col_chart = st.columns([2.5, 2])
 
         with col_table:
-            line_summary_tr = line_summary.rename(columns={
+            line_summary_tr = line_summary_with_totals.rename(columns={
                 "month": "Ay",
                 "working_days": "Çalışma Günleri",
                 "hours_per_day": "Günlük Çalışma Saati",
@@ -201,10 +205,11 @@ for tab, line in zip(tabs[1:-1], lines):
                     "Gereken Süre": "{:.1f}",
                     "Doluluk %": "{:.1f}%",
                 }),
-                use_container_width=True,
+                width="stretch",
             )
 
         with col_chart:
+            # chart stays on the plain monthly line_summary, same reasoning as above
             fig = make_subplots(specs=[[{"secondary_y": True}]])
             fig.add_trace(
                 go.Bar(x=line_summary["month"], y=line_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#4C72B0"),
@@ -228,7 +233,7 @@ for tab, line in zip(tabs[1:-1], lines):
             fig.update_xaxes(type="category", tickmode="linear")
             fig.update_yaxes(title_text="Saatler", secondary_y=False)
             fig.update_yaxes(title_text="Doluluk %", secondary_y=True)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         csv_bytes = line_summary.to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -239,7 +244,6 @@ for tab, line in zip(tabs[1:-1], lines):
             key=f"dl_{line}",
         )
 
-# Render the Kapasite Holdout Tab
 # ---------- Render the Kapasite Holdout Tab ----------
 with tabs[-1]:
     st.subheader("Müşteri Bazında Kapasite Analizi")
@@ -248,34 +252,42 @@ with tabs[-1]:
     else:
         holdout_raw = read_any(holdout_file)
         try:
-            if "line" in holdout_raw.columns and holdout_raw["line"].notna().any():
-                long_df = process_holdout_orders(holdout_raw, oee_by_line)
-            else:
-                long_df = process_holdout_orders(holdout_raw, holdout_oee)
+            validate_columns(holdout_raw, REQUIRED_HOLDOUT_COLS, "Holdout dosyası")
+            long_df = process_holdout_orders(holdout_raw)
         except Exception as e:
             st.error(f"Hesaplama hatası: {e}")
             st.stop()
 
+        # Only offer groupings the uploaded file actually supports —
+        # "Physical Line" only appears once your file has a 'line' column.
+        available_groups = {
+            k: v for k, v in HOLDOUT_GROUP_LABELS.items()
+            if k == "total" or k in long_df.columns
+        }
         group_col = st.selectbox(
             "Gruplama",
-            options=list(HOLDOUT_GROUP_LABELS.keys()),
-            format_func=lambda c: HOLDOUT_GROUP_LABELS[c],
+            options=list(available_groups.keys()),
+            format_func=lambda c: available_groups[c],
             key="holdout_group_select",
         )
-        pivot = build_holdout_summary(long_df, group_col)
+
+        try:
+            pivot = build_holdout_summary(long_df, group_col)
+        except Exception as e:
+            st.error(f"Hesaplama hatası: {e}")
+            st.stop()
 
         col_table, col_chart = st.columns([2, 3])
 
         with col_table:
-            st.dataframe(pivot.style.format("{:,.0f}"), use_container_width=True)
+            st.dataframe(pivot.style.format("{:,.0f}"), width="stretch")
 
         with col_chart:
             years_str = [str(y) for y in pivot.index.tolist()]
-            capacity_dict = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
+            capacity_df = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
 
             fig_holdout = go.Figure()
 
-            # 1. Bar Grafiği (Gereken Saatler)
             yearly_totals = pivot.sum(axis=1)
             pivot_pct = pivot.div(yearly_totals, axis=0) * 100
 
@@ -285,39 +297,47 @@ with tabs[-1]:
                     for year, val, pct in zip(years_str, pivot[col], pivot_pct[col])
                 ]
                 fig_holdout.add_trace(go.Bar(
-                    x=years_str,
-                    y=pivot[col],
-                    name=str(col),
-                    hoverinfo="text",
-                    hovertext=hover_text
+                    x=years_str, y=pivot[col], name=str(col),
+                    hoverinfo="text", hovertext=hover_text,
                 ))
 
-            # 2. Maksimum Yıllık Kapasite Çizgisi (Güvenli Lookup)
-            cap_values = [
-                capacity_dict.get(y, capacity_dict.get("default", 0))
-                for y in years_str
-            ]
-
-            fig_holdout.add_trace(go.Scatter(
-                x=years_str,
-                y=cap_values,
-                mode="lines+markers",
-                name="Maks. Yıllık Kapasite",
-                line=dict(color="red", width=3, dash="dash"),
-                hoverinfo="text",
-                hovertext=[f"Maks. Kapasite ({y}): {c:,.0f} sa" for y, c in zip(years_str, cap_values)],
-            ))
+            if group_col == "line":
+                # one dashed line per physical line, matched to its own bars
+                for line_name in pivot.columns:
+                    line_cap = capacity_df[capacity_df["line"] == line_name].set_index("year")["capacity_hours"]
+                    cap_values = [line_cap.get(y, 0) for y in years_str]
+                    fig_holdout.add_trace(go.Scatter(
+                        x=years_str, y=cap_values, mode="lines+markers",
+                        name=f"Maks. Kapasite — {line_name}",
+                        line=dict(width=3, dash="dash"),
+                        hoverinfo="text",
+                        hovertext=[f"{line_name} Maks. Kapasite ({y}): {c:,.0f} sa"
+                                   for y, c in zip(years_str, cap_values)],
+                    ))
+            else:
+                # combined capacity across all lines — this is TRK0001 + TRK0002's
+                # annual capacity added together, same source (compute_annual_
+                # capacity_from_calendar) the line tabs' totals are built from
+                combined = capacity_df.groupby("year")["capacity_hours"].sum()
+                cap_values = [combined.get(y, 0) for y in years_str]
+                fig_holdout.add_trace(go.Scatter(
+                    x=years_str, y=cap_values, mode="lines+markers",
+                    name="Maks. Yıllık Kapasite (Toplam)",
+                    line=dict(color="red", width=3, dash="dash"),
+                    hoverinfo="text",
+                    hovertext=[f"Toplam Maks. Kapasite ({y}): {c:,.0f} sa"
+                               for y, c in zip(years_str, cap_values)],
+                ))
 
             fig_holdout.update_layout(
                 barmode="stack",
-                title_text=f"Kapasite Holdout — {HOLDOUT_GROUP_LABELS[group_col]}",
-                xaxis_title="Yıl",
-                yaxis_title="Süre (Saat)",
+                title_text=f"Kapasite Holdout — {available_groups[group_col]}",
+                xaxis_title="Yıl", yaxis_title="Süre (Saat)",
                 margin=dict(l=20, r=20, t=40, b=20),
                 legend=dict(orientation="h", y=-0.2, xanchor="center", x=0.5),
             )
             fig_holdout.update_xaxes(type="category", tickmode="linear")
-            st.plotly_chart(fig_holdout, use_container_width=True)
+            st.plotly_chart(fig_holdout, width="stretch")
 
         csv_bytes = pivot.to_csv().encode("utf-8")
         st.download_button(

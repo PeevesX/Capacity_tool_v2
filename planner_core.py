@@ -24,7 +24,7 @@ def convert_to_meters(row: pd.Series) -> float:
             raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
         return row["quantity"] / row["width_m"]
 
-    if unit == "PCS":
+    if unit in ("PCS", "ADT"):
         if pd.isna(row["length_m"]) or row["length_m"] == 0:
             raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
         return row["quantity"] * row["length_m"]
@@ -49,7 +49,6 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     """One row per (line, month): effective capacity (scaled by OEE) vs. required hours vs. utilization %."""
     calendar = calendar.copy()
 
-    # Apply OEE directly to gross capacity
     calendar["oee"] = calendar["line"].map(oee_by_line)
     if calendar["oee"].isna().any():
         missing_lines = calendar[calendar["oee"].isna()]["line"].unique()
@@ -77,28 +76,55 @@ def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
         raise ValueError(f"{label} is missing columns: {missing}")
 
 
+def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds one 'YYYY Toplam' row per year to a monthly summary table that has
+    at least 'month', 'capacity_hours', 'required_hours'. Works for both a
+    single line's table (which also has working_days/hours_per_day) and the
+    combined all-lines table (which doesn't) — only sums columns that are
+    actually present, so it's safe to call on either shape.
+    """
+    df = monthly_df.copy()
+    df["year"] = df["month"].astype(str).str.slice(0, 4)
+
+    sum_cols = [c for c in ["working_days", "capacity_hours", "required_hours"] if c in df.columns]
+    totals = df.groupby("year")[sum_cols].sum().reset_index()
+    totals["month"] = totals["year"] + " Toplam"
+    if "hours_per_day" in df.columns:
+        totals["hours_per_day"] = ""
+    totals["utilization_pct"] = totals["required_hours"] / totals["capacity_hours"] * 100
+
+    ordered_cols = ["month"] + [c for c in df.columns if c not in ("month", "year")]
+    totals = totals.reindex(columns=ordered_cols, fill_value="")
+
+    return pd.concat([df[ordered_cols], totals], ignore_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Capacity holdout logic
 # ---------------------------------------------------------------------------
 
 REQUIRED_HOLDOUT_COLS = [
     "order_id", "customer_plant", "internal_external", "model_key",
-    "program_carline", "unit", "cycle_time_sec_per_unit",
+    "program_carline", "unit", "width_m", "length_m", "cycle_time_sec_per_m",
 ]
-HOLDOUT_YEAR_COLS = [f"vol_{y}" for y in range(2026, 2032)] + [str(y) for y in range(2026, 2032)] + list(range(2026, 2032))
+HOLDOUT_YEAR_COLS = (
+    [f"vol_{y}" for y in range(2026, 2032)]
+    + [str(y) for y in range(2026, 2032)]
+    + list(range(2026, 2032))
+)
 HOLDOUT_GROUP_LABELS = {
     "total": "Toplam (Genel Özet)",
     "customer_plant": "Company",
     "internal_external": "Internal / External",
     "model_key": "Customer / Model-Key",
     "program_carline": "Program / Carline",
+    "line": "Physical Line",
 }
 
 
 def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """
-    Pivot to: rows = year, columns = group_col values, cells = required_hours.
-    """
+    """Pivot to: rows = year, columns = group_col values, cells = required_hours."""
     grouped = long_df.copy()
 
     if group_col == "total":
@@ -108,29 +134,38 @@ def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame
     if group_col not in grouped.columns:
         raise ValueError(f"Unknown grouping column: {group_col}")
 
-    grouped[group_col] = grouped[group_col].fillna("Unspecified")
+    # Normalize the grouping column so values that only differ by stray
+    # whitespace or by being stored as text vs. number in Excel (e.g.
+    # "356" and "356 ") don't show up as separate, duplicate-looking groups.
+    grouped[group_col] = (
+        grouped[group_col].fillna("Unspecified").astype(str).str.strip()
+    )
 
     pivot = grouped.pivot_table(
-        index="year",
-        columns=group_col,
-        values="required_hours",
-        aggfunc="sum",
-        fill_value=0,
+        index="year", columns=group_col, values="required_hours",
+        aggfunc="sum", fill_value=0,
     )
     return pivot.sort_index()
 
 
-def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
+def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
     """
-    Reshape wide holdout orders into long format and compute required_hours.
+    Reshape wide holdout orders into long format, convert each row's volume
+    to meters (reuses the SAME convert_to_meters logic as the line-level
+    planner, so M/M2/PCS/ADT behave identically here), then compute
+    required_hours from cycle_time_sec_per_m — seconds to produce 1 meter.
+
+    No OEE here, on purpose: OEE is applied exactly once, on the capacity
+    side, in compute_annual_capacity_from_calendar. Dividing demand by OEE
+    here too would double-count it (once shrinking capacity, once
+    inflating demand), which overstates utilization.
     """
     orders = orders.copy()
-    # Standardize column headers to string
     orders.columns = [str(c) for c in orders.columns]
 
     year_cols = [c for c in orders.columns if c.startswith("vol_") or c in [str(y) for y in range(2026, 2032)]]
     if not year_cols:
-        raise ValueError(f"No year volume columns found in file.")
+        raise ValueError("No year volume columns found in file.")
 
     id_cols = [c for c in orders.columns if c not in year_cols]
     long_df = orders.melt(id_vars=id_cols, value_vars=year_cols,
@@ -138,33 +173,30 @@ def process_holdout_orders(orders: pd.DataFrame, oee) -> pd.DataFrame:
     long_df["year"] = long_df["year"].astype(str).str.replace("vol_", "", regex=False)
     long_df["volume"] = pd.to_numeric(long_df["volume"], errors="coerce").fillna(0)
 
-    ideal_hours = (long_df["volume"] * long_df["cycle_time_sec_per_unit"]) / 3600
+    # convert_to_meters expects a 'quantity' column (and only uses 'order_id'
+    # for error messages) — map volume onto it so M/M2/PCS/ADT all convert
+    # the same way here as they do in the line-level planner.
+    long_df["quantity"] = long_df["volume"]
+    long_df["meters"] = long_df.apply(convert_to_meters, axis=1)
 
-    if isinstance(oee, dict):
-        if "line" not in long_df.columns:
-            # If no line column present, fallback to average of oee_by_line
-            avg_oee = sum(oee.values()) / len(oee) if oee else 0.78
-            long_df["required_hours"] = ideal_hours / avg_oee
-        else:
-            missing = set(long_df["line"].dropna().unique()) - set(oee.keys())
-            if missing:
-                raise ValueError(f"No OEE set for line(s): {sorted(missing)}")
-            long_df["required_hours"] = ideal_hours / long_df["line"].map(oee)
-    else:
-        long_df["required_hours"] = ideal_hours / oee
+    long_df["required_hours"] = (long_df["meters"] * long_df["cycle_time_sec_per_m"]) / 3600
 
     return long_df
 
 
-def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> dict:
+def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
     """
-    Computes total annual net capacity hours per line aggregated across all months.
+    Per (line, year): capacity_hours, built from the calendar's 'month'
+    column (e.g. '2027-01'). Returns a DataFrame — not a flat dict — so
+    each line's own capacity can be plotted separately, and each year
+    reflects its own actual working days/hours instead of one averaged
+    total reused everywhere.
     """
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
+    if df["oee"].isna().any():
+        missing = df[df["oee"].isna()]["line"].unique()
+        raise ValueError(f"Missing OEE for line(s): {missing}")
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
-
-    annual_total = df["capacity_hours"].sum()
-    
-    # Returns annual capacity mapped to all holdout years (2026-2031)
-    return {str(y): annual_total for y in range(2026, 2032)}
+    df["year"] = df["month"].astype(str).str.slice(0, 4)
+    return df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
