@@ -41,8 +41,6 @@ HOLDOUT_METRICS = {
 
 # Lines that run double-width material and slit it into two strips, so one
 # meter of machine travel yields two meters of finished product.
-# Add a line code here (e.g. "TRK0003") if another double-width line is
-# introduced later — nothing else in this file needs to change.
 DOUBLE_WIDTH_LINES = {"TRK0002"}
 
 HOLDOUT_FORECAST_YEARS = range(2026, 2032)
@@ -85,14 +83,7 @@ def convert_to_meters(row: pd.Series) -> float:
 
 
 def convert_to_m2(row: pd.Series) -> float:
-    """
-    Turn one order's quantity into square meters (finished area), based on unit.
-
-    - M2: quantity is already an area — used as-is.
-    - M: quantity is a length, so multiply by width_m to get area.
-    - PCS / ADT: quantity is a piece count, so multiply by length_m * width_m
-      (each piece's own area) to get total area.
-    """
+    """Turn one order's quantity into square meters (finished area), based on unit."""
     unit = str(row.get("unit", "")).strip().upper()
     qty = row["quantity"]
 
@@ -115,15 +106,7 @@ def convert_to_m2(row: pd.Series) -> float:
 
 
 def compute_required_hours(row: pd.Series) -> float:
-    """
-    Ideal production time required for the order (without OEE).
-
-    Double-width lines (see DOUBLE_WIDTH_LINES) split the web down the
-    middle after production, so the machine only has to travel half the
-    finished meters — hence the /2. This only affects *hours*; the
-    finished-meters figure (row["meters"]) is unaffected, since the
-    customer still receives the full meterage.
-    """
+    """Ideal production time required for the order (without OEE)."""
     base_hours = (row["meters"] * row["cycle_time_sec_per_m"]) / 3600
 
     if str(row.get("line", "")).strip() in DOUBLE_WIDTH_LINES:
@@ -149,6 +132,8 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     """
     One row per (line, month): effective capacity (scaled by OEE), required
     hours, produced meters, produced m², and utilization %.
+    For m² and meters on shared/sandwich orders split across lines, 
+    duplicate order references are handled so physical shipment totals remain correct.
     """
     calendar = calendar.copy()
 
@@ -160,11 +145,24 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["gross_capacity_hours"] = calendar["working_days"] * calendar["hours_per_day"]
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
-    demand = (
-        orders.groupby(["line", "month"])[["required_hours", "meters", "m2"]]
+    # For required_hours, sum normally per line & month
+    demand_hours = (
+        orders.groupby(["line", "month"])["required_hours"]
         .sum()
         .reset_index()
     )
+
+    # For meters and m2, if an order_id appears multiple times across lines (sandwiches), 
+    # take unique order values per line or drop duplicates for physical shipment summation
+    orders_unique_metric = orders.drop_duplicates(subset=["order_id", "line", "month"])
+    demand_metrics = (
+        orders_unique_metric.groupby(["line", "month"])[["meters", "m2"]]
+        .sum()
+        .reset_index()
+    )
+
+    demand = pd.merge(demand_hours, demand_metrics, on=["line", "month"], how="outer")
+
     summary = calendar.merge(demand, on=["line", "month"], how="left")
     summary["required_hours"] = summary["required_hours"].fillna(0)
     summary["meters"] = summary["meters"].fillna(0)
@@ -174,11 +172,7 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
 
 
 def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds one 'YYYY Toplam' row per year to a monthly summary table that has
-    at least 'month', 'capacity_hours', 'required_hours' (and, if present,
-    'meters' / 'm2').
-    """
+    """Adds one 'YYYY Toplam' row per year to a monthly summary table."""
     df = monthly_df.copy()
     df["year"] = df["month"].astype(str).str.slice(0, 4)
 
@@ -196,7 +190,6 @@ def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _safe_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    """numerator / denominator * 100, without blowing up on zero-capacity rows."""
     denom = denominator.replace(0, pd.NA)
     return (numerator / denom * 100).fillna(0)
 
@@ -206,11 +199,7 @@ def _safe_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reshape wide holdout orders (one column per forecast year) into long
-    format, convert volume to meters and m², and compute required_hours
-    using compute_required_hours() — including the double-width halving.
-    """
+    """Reshape wide holdout orders into long format and compute metrics."""
     orders = orders.copy()
     orders.columns = [str(c).strip() for c in orders.columns]
 
@@ -245,11 +234,12 @@ def build_holdout_summary(
     long_df: pd.DataFrame, group_col: str,
     value_col: str = "required_hours", total_label: str = "Toplam Gereken Süre",
 ) -> pd.DataFrame:
-    """
-    Pivot to: rows = year, columns = group_col values, cells = value_col
-    ('required_hours', 'meters', or 'm2' — see HOLDOUT_METRICS).
-    """
+    """Pivot holdout summary table."""
     grouped = long_df.copy()
+
+    if value_col in ["meters", "m2"] and "order_id" in grouped.columns:
+        # For physical shipment metrics on holdout/sandwiches, avoid double counting duplicate references if split
+        grouped = grouped.drop_duplicates(subset=["year", "order_id", group_col] if group_col != "total" else ["year", "order_id"])
 
     if group_col == "total":
         pivot = grouped.groupby("year")[value_col].sum().to_frame(name=total_label)
@@ -268,34 +258,7 @@ def build_holdout_summary(
 
 
 def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame):
-    """
-    Reconcile the regular orders file with the holdout forecast.
-
-    Two things happen here:
-
-    1. Multi-line split: if an order_id appears against a single line in
-       orders_df but against multiple lines in holdout_df (e.g. a
-       sandwich/double-layer product produced partly on TRK0001 and partly
-       on TRK0002), this duplicates that order row once per line the
-       holdout lists. Each copy carries the order's full quantity —
-       that's intentional: the holdout's per-line rows already represent
-       that line's full run, not a split of one shared quantity.
-
-    2. Cycle-time standardization: holdout is treated as the source of
-       truth for cycle_time_sec_per_m. Wherever an order_id also appears
-       in the holdout file, the holdout's cycle_time_sec_per_m overrides
-       whatever value is in the orders file, *if the two differ*. Every
-       such override is recorded so the caller can show the user what
-       changed and why — nothing is silently altered.
-
-    Orders whose order_id doesn't appear in holdout at all are left
-    completely untouched, keeping their own cycle_time_sec_per_m.
-
-    Returns:
-        (aligned_orders_df, overrides_df) — overrides_df has one row per
-        order_id/line whose cycle_time_sec_per_m was replaced, with columns
-        order_id, line, eski_cycle_time, yeni_cycle_time. Empty if none.
-    """
+    """Reconcile regular orders with holdout forecast and standardize cycle times."""
     orders = orders_df.copy()
     holdout = holdout_df.copy()
 
@@ -308,7 +271,6 @@ def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame)
     has_holdout_cycle_time = "cycle_time_sec_per_m" in holdout.columns
 
     def _apply_cycle_time_override(row_copy: dict, h_row: pd.Series, overrides: list) -> None:
-        """Mutates row_copy in place, appending to overrides if the value actually changed."""
         if not has_holdout_cycle_time or pd.isna(h_row.get("cycle_time_sec_per_m")):
             return
         new_ct = float(h_row["cycle_time_sec_per_m"])
@@ -333,16 +295,12 @@ def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame)
             continue
 
         if len(matching_holdout) > 1 and "line" in matching_holdout.columns:
-            # Multi-line split: one duplicated row per holdout line, each
-            # taking that line's own cycle time.
             for _, h_row in matching_holdout.iterrows():
                 row_copy = group.iloc[0].to_dict()
                 row_copy["line"] = h_row["line"]
                 _apply_cycle_time_override(row_copy, h_row, overrides)
                 aligned_rows.append(row_copy)
         else:
-            # Single-line match: keep the order row(s) as-is except for a
-            # possible cycle-time override from holdout.
             h_row = matching_holdout.iloc[0]
             for _, o_row in group.iterrows():
                 row_copy = o_row.to_dict()
@@ -355,14 +313,7 @@ def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame)
 
 
 def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
-    """
-    Yearly capacity per line, extended out across HOLDOUT_FORECAST_YEARS.
-
-    Lines with calendar data for a given year use that year's actual
-    total; lines missing a year (e.g. no calendar rows entered yet for
-    2029+) fall back to that line's overall calendar total as a stand-in
-    estimate.
-    """
+    """Yearly capacity per line extended across HOLDOUT_FORECAST_YEARS."""
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
 
