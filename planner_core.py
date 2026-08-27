@@ -372,7 +372,6 @@ def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line
 
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
     df["year"] = df["month"].astype(str).str.slice(0, 4)
-<<<<<<< HEAD
 
     annual_by_line = df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
 
@@ -390,6 +389,3 @@ def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line
             records.append({"line": line, "year": year, "capacity_hours": value})
 
     return pd.DataFrame(records)
-=======
-    return df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
->>>>>>> 9985f300a19b7661f2c2e4c235bcd8f0877c0f05
