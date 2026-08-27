@@ -5,9 +5,11 @@ import streamlit as st
 
 from planner_core import (
     HOLDOUT_GROUP_LABELS,
+    HOLDOUT_METRICS,
     REQUIRED_CALENDAR_COLS,
     REQUIRED_HOLDOUT_COLS,
     REQUIRED_ORDER_COLS,
+    align_orders_with_holdout,
     append_year_totals,
     build_holdout_summary,
     build_monthly_summary,
@@ -19,7 +21,10 @@ from planner_core import (
 
 st.set_page_config(page_title="Tarak Hattı Fizibilite Planlayıcı", layout="wide")
 
-# Header Section
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
 col1, col2 = st.columns([1, 5], vertical_alignment="center")
 with col1:
     st.image("ototeks_logo.svg", width=180)
@@ -27,13 +32,27 @@ with col2:
     st.title("Tarak Hattı Fizibilite Planlayıcı")
 
 
-# ---------- Caching ----------
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+
 @st.cache_data(show_spinner=False)
 def read_any(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    return pd.read_excel(uploaded_file)
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+
+    if not isinstance(df, pd.DataFrame):
+        # Guards against e.g. an Excel file with sheet_name set elsewhere
+        # returning a dict of sheets, or any other non-DataFrame result —
+        # fail with a clear message here instead of a cryptic error later.
+        raise TypeError(
+            f"'{uploaded_file.name}' bir tablo olarak okunamadı (tür: {type(df).__name__}). "
+            "Dosyanın tek bir sayfa/tablo içerdiğinden emin olun."
+        )
+    return df
 
 
 @st.cache_data(show_spinner=False)
@@ -43,7 +62,80 @@ def get_processed_line_data(orders_df: pd.DataFrame, calendar_df: pd.DataFrame, 
     return processed, summary
 
 
-# ---------- Sidebar: Inputs ----------
+# ---------------------------------------------------------------------------
+# Chart helpers (shared by the "Tüm Hatlar" tab and each per-line tab)
+# ---------------------------------------------------------------------------
+
+def capacity_vs_demand_chart(
+    df: pd.DataFrame, title: str,
+    capacity_color: str = "#4C72B0", required_color: str = "#DD8452",
+) -> go.Figure:
+    """Grouped bar (capacity vs. required hours) + utilization % line, with a 100% reference line."""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(x=df["month"], y=df["capacity_hours"], name="Kapasite (sa)", marker_color=capacity_color),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(x=df["month"], y=df["required_hours"], name="Gereken (sa)", marker_color=required_color),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["month"], y=df["utilization_pct"], name="Doluluk %",
+            mode="lines+markers+text",
+            line=dict(color="black"),
+            text=[f"{v:.0f}%" for v in df["utilization_pct"]],
+            textposition="top center",
+            textfont=dict(size=11, color="black"),
+        ),
+        secondary_y=True,
+    )
+    fig.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
+
+    fig.update_layout(
+        title_text=title,
+        barmode="group",
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(type="category", tickmode="linear")
+    fig.update_yaxes(title_text="Saatler", secondary_y=False)
+    fig.update_yaxes(title_text="Doluluk %", secondary_y=True)
+    return fig
+
+
+def production_meters_chart(df: pd.DataFrame, title: str, color: str = "#2E8B57") -> go.Figure:
+    """Simple bar chart of produced meters per month, with the value labeled on each bar."""
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df["month"], y=df["meters"], name="Üretilen Metre",
+        marker_color=color,
+        text=[f"{v:,.0f}" for v in df["meters"]],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title_text=title,
+        margin=dict(l=10, r=10, t=40, b=10),
+        showlegend=False,
+    )
+    fig.update_xaxes(type="category", tickmode="linear")
+    fig.update_yaxes(title_text="Metre")
+    return fig
+
+
+def render_summary_table(df: pd.DataFrame, columns_tr: dict, number_formats: dict) -> None:
+    """Rename to Turkish display columns, format, and render as a dataframe."""
+    df_tr = df.rename(columns=columns_tr)
+    display_cols = list(columns_tr.values())
+    st.dataframe(df_tr[display_cols].style.format(number_formats), width="stretch")
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: file uploads
+# ---------------------------------------------------------------------------
+
 st.sidebar.header("1. Dosya Yükle")
 calendar_file = st.sidebar.file_uploader(
     "Takvim (hat, ay, çalışma_günleri, günlük_çalışma_saati)",
@@ -70,18 +162,10 @@ except Exception as e:
     st.error(f"Dosya okunurken hata oluştu: {e}")
     st.stop()
 
-lines = sorted(orders_df["line"].dropna().unique())
-if not lines:
-    st.error("Sipariş dosyasında 'hat' sütununda değer bulunamadı.")
-    st.stop()
+# ---------------------------------------------------------------------------
+# Sidebar: capacity holdout upload + order/line alignment
+# ---------------------------------------------------------------------------
 
-oee_by_line = {}
-for line in lines:
-    oee_by_line[line] = st.sidebar.number_input(
-        f"OEE — {line}", min_value=0.01, max_value=1.0, value=0.78, step=0.01, key=f"oee_{line}"
-    )
-
-# ---------- Sidebar: 3. Kapasite Holdout ----------
 st.sidebar.markdown("---")
 st.sidebar.header("3. Kapasite Holdout")
 holdout_file = st.sidebar.file_uploader(
@@ -89,7 +173,46 @@ holdout_file = st.sidebar.file_uploader(
     type=["xlsx", "csv"],
 )
 
-# ---------- Data Preview ----------
+cycle_time_overrides = pd.DataFrame(columns=["order_id", "line", "eski_cycle_time", "yeni_cycle_time"])
+
+if holdout_file:
+    try:
+        holdout_raw_check = read_any(holdout_file)
+        orders_df, cycle_time_overrides = align_orders_with_holdout(orders_df, holdout_raw_check)
+    except Exception as e:
+        st.sidebar.warning(f"Sipariş/holdout hat eşleştirmesi atlandı: {e}")
+
+lines = sorted(orders_df["line"].dropna().unique())
+if not lines:
+    st.error("Sipariş dosyasında 'hat' sütununda değer bulunamadı.")
+    st.stop()
+
+oee_by_line = {
+    line: st.sidebar.number_input(
+        f"OEE — {line}", min_value=0.01, max_value=1.0, value=0.78, step=0.01, key=f"oee_{line}"
+    )
+    for line in lines
+}
+
+# ---------------------------------------------------------------------------
+# Data preview
+# ---------------------------------------------------------------------------
+
+if not cycle_time_overrides.empty:
+    with st.expander(
+        f"⚠️ Holdout dosyasından {len(cycle_time_overrides)} adet çevrim süresi (cycle_time_sec_per_m) güncellendi",
+        expanded=False,
+    ):
+        st.dataframe(
+            cycle_time_overrides.rename(columns={
+                "order_id": "Sipariş No",
+                "line": "Hat",
+                "eski_cycle_time": "Eski Çevrim Süresi (sn/m)",
+                "yeni_cycle_time": "Yeni Çevrim Süresi (sn/m, Holdout)",
+            }),
+            width="stretch",
+        )
+
 with st.expander("Önizleme: Takvim ve Siparişler"):
     c1, c2 = st.columns(2)
     c1.write("**Calendar**")
@@ -103,83 +226,66 @@ except Exception as e:
     st.error(f"Hesaplama hatası: {e}")
     st.stop()
 
-# Build Total Aggregated Summary across all lines per month
+# Aggregate across all lines, per month, for the combined tab
 total_summary = (
-    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours"]]
-    .sum()
+    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours", "meters"]].sum()
 )
 total_summary["utilization_pct"] = (
     total_summary["required_hours"] / total_summary["capacity_hours"] * 100
 )
 
-# ---------- Dynamic Tab Generation ----------
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+
 tab_names = ["Tüm Hatlar (Toplam)"] + list(lines) + ["Kapasite Holdout"]
 tabs = st.tabs(tab_names)
 
-# Render Combined Tab (All Lines)
+# --- Combined ("Tüm Hatlar") tab -------------------------------------------
 with tabs[0]:
     st.subheader("Tüm Hatlar — Toplam Aylık Özet")
     col_table, col_chart = st.columns([2.5, 2])
 
     with col_table:
-        # append_year_totals adds a "2027 Toplam" row summing TRK0001 + TRK0002
-        # combined capacity/required hours for that year, directly below the months.
         total_summary_with_totals = append_year_totals(total_summary)
-        total_summary_tr = total_summary_with_totals.rename(columns={
-            "month": "Ay",
-            "capacity_hours": "Toplam Kapasite Saatleri",
-            "required_hours": "Toplam Gereken Süre",
-            "utilization_pct": "Ortalama Doluluk %",
-        })
-        st.dataframe(
-            total_summary_tr[
-                ["Ay", "Toplam Kapasite Saatleri", "Toplam Gereken Süre", "Ortalama Doluluk %"]
-            ].style.format({
+        render_summary_table(
+            total_summary_with_totals,
+            columns_tr={
+                "month": "Ay",
+                "capacity_hours": "Toplam Kapasite Saatleri",
+                "required_hours": "Toplam Gereken Süre",
+                "meters": "Üretilen Metre",
+                "utilization_pct": "Ortalama Doluluk %",
+            },
+            number_formats={
                 "Toplam Kapasite Saatleri": "{:.0f}",
                 "Toplam Gereken Süre": "{:.1f}",
+                "Üretilen Metre": "{:,.0f}",
                 "Ortalama Doluluk %": "{:.1f}%",
-            }),
-            width="stretch",
+            },
         )
 
     with col_chart:
-        # chart stays on the plain monthly total_summary — a "2027 Toplam"
-        # column mixed into month labels on the x-axis would look wrong here
-        fig_tot = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_tot.add_trace(
-            go.Bar(x=total_summary["month"], y=total_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#1f77b4"),
-            secondary_y=False,
+        fig_tot = capacity_vs_demand_chart(
+            total_summary, "Tüm Hatlar Toplamı: Kapasite vs Gereken Süre",
+            capacity_color="#1f77b4", required_color="#ff7f0e",
         )
-        fig_tot.add_trace(
-            go.Bar(x=total_summary["month"], y=total_summary["required_hours"], name="Gereken (sa)", marker_color="#ff7f0e"),
-            secondary_y=False,
-        )
-        fig_tot.add_trace(
-            go.Scatter(x=total_summary["month"], y=total_summary["utilization_pct"], name="Doluluk %", mode="lines+markers", line=dict(color="black")),
-            secondary_y=True,
-        )
-        fig_tot.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
-        fig_tot.update_layout(
-            title_text="Tüm Hatlar Toplamı: Kapasite vs Gereken Süre",
-            barmode="group",
-            margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        fig_tot.update_xaxes(type="category", tickmode="linear")
-        fig_tot.update_yaxes(title_text="Saatler", secondary_y=False)
-        fig_tot.update_yaxes(title_text="Doluluk %", secondary_y=True)
         st.plotly_chart(fig_tot, width="stretch")
 
-    csv_bytes_tot = total_summary.to_csv(index=False).encode("utf-8")
+    st.plotly_chart(
+        production_meters_chart(total_summary, "Tüm Hatlar Toplamı: Üretilen Metre"),
+        width="stretch",
+    )
+
     st.download_button(
         label="Tüm hatlar özetini CSV olarak indir",
-        data=csv_bytes_tot,
+        data=total_summary.to_csv(index=False).encode("utf-8"),
         file_name="tum_hatlar_toplam_ozet.csv",
         mime="text/csv",
         key="dl_total",
     )
 
-# Render individual Line tabs (TRK0001, TRK0002 etc.)
+# --- Per-line tabs -----------------------------------------------------------
 for tab, line in zip(tabs[1:-1], lines):
     with tab:
         line_summary = summary[summary["line"] == line].reset_index(drop=True)
@@ -189,64 +295,46 @@ for tab, line in zip(tabs[1:-1], lines):
         col_table, col_chart = st.columns([2.5, 2])
 
         with col_table:
-            line_summary_tr = line_summary_with_totals.rename(columns={
-                "month": "Ay",
-                "working_days": "Çalışma Günleri",
-                "hours_per_day": "Günlük Çalışma Saati",
-                "capacity_hours": "Kapasite Saatleri",
-                "required_hours": "Gereken Süre",
-                "utilization_pct": "Doluluk %",
-            })
-            st.dataframe(
-                line_summary_tr[
-                    ["Ay", "Çalışma Günleri", "Günlük Çalışma Saati", "Kapasite Saatleri", "Gereken Süre", "Doluluk %"]
-                ].style.format({
+            render_summary_table(
+                line_summary_with_totals,
+                columns_tr={
+                    "month": "Ay",
+                    "working_days": "Çalışma Günleri",
+                    "hours_per_day": "Günlük Çalışma Saati",
+                    "capacity_hours": "Kapasite Saatleri",
+                    "required_hours": "Gereken Süre",
+                    "meters": "Üretilen Metre",
+                    "utilization_pct": "Doluluk %",
+                },
+                number_formats={
                     "Kapasite Saatleri": "{:.0f}",
                     "Gereken Süre": "{:.1f}",
+                    "Üretilen Metre": "{:,.0f}",
                     "Doluluk %": "{:.1f}%",
-                }),
-                width="stretch",
+                },
             )
 
         with col_chart:
-            # chart stays on the plain monthly line_summary, same reasoning as above
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_trace(
-                go.Bar(x=line_summary["month"], y=line_summary["capacity_hours"], name="Kapasite (sa)", marker_color="#4C72B0"),
-                secondary_y=False,
-            )
-            fig.add_trace(
-                go.Bar(x=line_summary["month"], y=line_summary["required_hours"], name="Gereken (sa)", marker_color="#DD8452"),
-                secondary_y=False,
-            )
-            fig.add_trace(
-                go.Scatter(x=line_summary["month"], y=line_summary["utilization_pct"], name="Doluluk %", mode="lines+markers", line=dict(color="black")),
-                secondary_y=True,
-            )
-            fig.add_hline(y=100, line_dash="dash", line_color="red", secondary_y=True)
-            fig.update_layout(
-                title_text=f"{line}: Kapasite vs Gereken Süre",
-                barmode="group",
-                margin=dict(l=10, r=10, t=40, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            fig.update_xaxes(type="category", tickmode="linear")
-            fig.update_yaxes(title_text="Saatler", secondary_y=False)
-            fig.update_yaxes(title_text="Doluluk %", secondary_y=True)
+            fig = capacity_vs_demand_chart(line_summary, f"{line}: Kapasite vs Gereken Süre")
             st.plotly_chart(fig, width="stretch")
 
-        csv_bytes = line_summary.to_csv(index=False).encode("utf-8")
+        st.plotly_chart(
+            production_meters_chart(line_summary, f"{line}: Üretilen Metre"),
+            width="stretch",
+        )
+
         st.download_button(
             label=f"Download {line} summary as CSV",
-            data=csv_bytes,
+            data=line_summary.to_csv(index=False).encode("utf-8"),
             file_name=f"{line}_monthly_summary.csv",
             mime="text/csv",
             key=f"dl_{line}",
         )
 
-# ---------- Render the Kapasite Holdout Tab ----------
+# --- Capacity holdout tab ---------------------------------------------------
 with tabs[-1]:
     st.subheader("Müşteri Bazında Kapasite Analizi")
+
     if not holdout_file:
         st.info("Kapasite dosyasını sol menüden yükleyin.")
     else:
@@ -258,21 +346,36 @@ with tabs[-1]:
             st.error(f"Hesaplama hatası: {e}")
             st.stop()
 
-        # Only offer groupings the uploaded file actually supports —
-        # "Physical Line" only appears once your file has a 'line' column.
         available_groups = {
             k: v for k, v in HOLDOUT_GROUP_LABELS.items()
             if k == "total" or k in long_df.columns
         }
-        group_col = st.selectbox(
-            "Gruplama",
-            options=list(available_groups.keys()),
-            format_func=lambda c: available_groups[c],
-            key="holdout_group_select",
-        )
+
+        col_select1, col_select2 = st.columns([2, 1])
+        with col_select1:
+            group_col = st.selectbox(
+                "Gruplama",
+                options=list(available_groups.keys()),
+                format_func=lambda c: available_groups[c],
+                key="holdout_group_select",
+            )
+        with col_select2:
+            metric_col = st.radio(
+                "Birim",
+                options=list(HOLDOUT_METRICS.keys()),
+                format_func=lambda m: HOLDOUT_METRICS[m]["label"],
+                horizontal=True,
+                key="holdout_metric_select",
+            )
+
+        metric_info = HOLDOUT_METRICS[metric_col]
+        unit = metric_info["unit"]
 
         try:
-            pivot = build_holdout_summary(long_df, group_col)
+            pivot = build_holdout_summary(
+                long_df, group_col,
+                value_col=metric_col, total_label=metric_info["total_label"],
+            )
         except Exception as e:
             st.error(f"Hesaplama hatası: {e}")
             st.stop()
@@ -284,7 +387,6 @@ with tabs[-1]:
 
         with col_chart:
             years_str = [str(y) for y in pivot.index.tolist()]
-            capacity_df = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
 
             fig_holdout = go.Figure()
 
@@ -293,7 +395,7 @@ with tabs[-1]:
 
             for col in pivot.columns:
                 hover_text = [
-                    f"<b>{col}</b><br>Yıl: {year}<br>Gereken Süre: {val:,.1f} sa<br>Payı: %{pct:.1f}"
+                    f"<b>{col}</b><br>Yıl: {year}<br>{metric_info['label']}: {val:,.1f} {unit}<br>Payı: %{pct:.1f}"
                     for year, val, pct in zip(years_str, pivot[col], pivot_pct[col])
                 ]
                 fig_holdout.add_trace(go.Bar(
@@ -301,49 +403,47 @@ with tabs[-1]:
                     hoverinfo="text", hovertext=hover_text,
                 ))
 
-            if group_col == "line":
-                # one dashed line per physical line, matched to its own bars
-                for line_name in pivot.columns:
-                    line_cap = capacity_df[capacity_df["line"] == line_name].set_index("year")["capacity_hours"]
-                    cap_values = [line_cap.get(y, 0) for y in years_str]
+            # A capacity comparison line only makes sense for the hours
+            # metric — there's no meaningful "capacity in meters".
+            if metric_col == "required_hours":
+                capacity_df = compute_annual_capacity_from_calendar(calendar_df, oee_by_line)
+
+                if group_col == "line":
+                    for line_name in pivot.columns:
+                        line_cap = capacity_df[capacity_df["line"] == line_name].set_index("year")["capacity_hours"]
+                        cap_values = [line_cap.get(y, 0) for y in years_str]
+                        fig_holdout.add_trace(go.Scatter(
+                            x=years_str, y=cap_values, mode="lines+markers",
+                            name=f"Kapasite — {line_name}",
+                            line=dict(width=3, dash="dash"),
+                            hoverinfo="text",
+                            hovertext=[f"{line_name} ({y}): {c:,.0f} sa" for y, c in zip(years_str, cap_values)],
+                        ))
+                else:
+                    total_factory_capacity = capacity_df.groupby("year")["capacity_hours"].sum()
+                    cap_values = [total_factory_capacity.get(y, 0) for y in years_str]
                     fig_holdout.add_trace(go.Scatter(
                         x=years_str, y=cap_values, mode="lines+markers",
-                        name=f"Maks. Kapasite — {line_name}",
-                        line=dict(width=3, dash="dash"),
+                        name="Toplam Fabrika Kapasitesi (2 Hat Toplamı)",
+                        line=dict(color="red", width=3, dash="dash"),
                         hoverinfo="text",
-                        hovertext=[f"{line_name} Maks. Kapasite ({y}): {c:,.0f} sa"
-                                   for y, c in zip(years_str, cap_values)],
+                        hovertext=[f"Toplam 2 Hat Kapasitesi ({y}): {c:,.0f} sa" for y, c in zip(years_str, cap_values)],
                     ))
-            else:
-                # combined capacity across all lines — this is TRK0001 + TRK0002's
-                # annual capacity added together, same source (compute_annual_
-                # capacity_from_calendar) the line tabs' totals are built from
-                combined = capacity_df.groupby("year")["capacity_hours"].sum()
-                cap_values = [combined.get(y, 0) for y in years_str]
-                fig_holdout.add_trace(go.Scatter(
-                    x=years_str, y=cap_values, mode="lines+markers",
-                    name="Maks. Yıllık Kapasite (Toplam)",
-                    line=dict(color="red", width=3, dash="dash"),
-                    hoverinfo="text",
-                    hovertext=[f"Toplam Maks. Kapasite ({y}): {c:,.0f} sa"
-                               for y, c in zip(years_str, cap_values)],
-                ))
 
             fig_holdout.update_layout(
                 barmode="stack",
-                title_text=f"Kapasite Holdout — {available_groups[group_col]}",
-                xaxis_title="Yıl", yaxis_title="Süre (Saat)",
+                title_text=f"Kapasite Holdout — {available_groups[group_col]} ({metric_info['label']})",
+                xaxis_title="Yıl", yaxis_title=metric_info["label"],
                 margin=dict(l=20, r=20, t=40, b=20),
                 legend=dict(orientation="h", y=-0.2, xanchor="center", x=0.5),
             )
             fig_holdout.update_xaxes(type="category", tickmode="linear")
             st.plotly_chart(fig_holdout, width="stretch")
 
-        csv_bytes = pivot.to_csv().encode("utf-8")
         st.download_button(
             "Holdout özetini indir",
-            data=csv_bytes,
-            file_name="kapasite_holdout.csv",
+            data=pivot.to_csv().encode("utf-8"),
+            file_name=f"kapasite_holdout_{metric_col}.csv",
             mime="text/csv",
             key="dl_holdout",
         )

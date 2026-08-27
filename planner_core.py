@@ -1,9 +1,16 @@
 """
 Shared capacity-planning logic for carding lines TRK0001 / TRK0002 (or more).
 Both the CLI script and the Streamlit app import from here.
+
+Nothing in this module touches Streamlit — it's pure pandas so it can be
+unit-tested and reused outside the app.
 """
 
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 REQUIRED_ORDER_COLS = [
     "order_id", "product", "line", "month", "unit",
@@ -11,30 +18,87 @@ REQUIRED_ORDER_COLS = [
 ]
 REQUIRED_CALENDAR_COLS = ["line", "month", "working_days", "hours_per_day"]
 
+REQUIRED_HOLDOUT_COLS = [
+    "order_id", "customer_plant", "internal_external", "model_key",
+    "program_carline", "unit", "width_m", "length_m", "cycle_time_sec_per_m",
+]
+
+HOLDOUT_GROUP_LABELS = {
+    "total": "Toplam (Genel Özet)",
+    "customer_plant": "Company",
+    "internal_external": "Internal / External",
+    "model_key": "Customer / Model-Key",
+    "program_carline": "Program / Carline",
+    "line": "Physical Line",
+}
+
+# value_col options for the holdout pivot/summary — hours or meters.
+HOLDOUT_METRICS = {
+    "required_hours": {"label": "Süre (Saat)", "unit": "sa", "total_label": "Toplam Gereken Süre"},
+    "meters": {"label": "Üretim (Metre)", "unit": "m", "total_label": "Toplam Üretilen Metre"},
+}
+
+# Lines that run double-width material and slit it into two strips, so one
+# meter of machine travel yields two meters of finished product.
+# Add a line code here (e.g. "TRK0003") if another double-width line is
+# introduced later — nothing else in this file needs to change.
+DOUBLE_WIDTH_LINES = {"TRK0002"}
+
+HOLDOUT_FORECAST_YEARS = range(2026, 2032)
+
+
+# ---------------------------------------------------------------------------
+# Column validation
+# ---------------------------------------------------------------------------
+
+def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
+    """Raise a clear error listing any required columns missing from df."""
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label} is missing columns: {missing}")
+
+
+# ---------------------------------------------------------------------------
+# Orders -> required hours / meters
+# ---------------------------------------------------------------------------
 
 def convert_to_meters(row: pd.Series) -> float:
-    """Turn one order's quantity into linear meters, based on unit."""
-    unit = row["unit"]
+    """Turn one order's quantity into linear (finished) meters, based on unit."""
+    unit = str(row.get("unit", "")).strip().upper()
+    qty = row["quantity"]
 
     if unit == "M":
-        return row["quantity"]
+        return qty
 
     if unit == "M2":
         if pd.isna(row["width_m"]) or row["width_m"] == 0:
-            raise ValueError(f"{row['order_id']}: {unit} order needs width_m")
-        return row["quantity"] / row["width_m"]
+            raise ValueError(f"{row.get('order_id', '?')}: {unit} order needs width_m")
+        return qty / row["width_m"]
 
     if unit in ("PCS", "ADT"):
         if pd.isna(row["length_m"]) or row["length_m"] == 0:
-            raise ValueError(f"{row['order_id']}: {unit} order needs length_m")
-        return row["quantity"] * row["length_m"]
+            raise ValueError(f"{row.get('order_id', '?')}: {unit} order needs length_m")
+        return qty * row["length_m"]
 
-    raise ValueError(f"{row['order_id']}: unknown unit '{unit}'")
+    raise ValueError(f"{row.get('order_id', '?')}: unknown unit '{unit}'")
 
 
 def compute_required_hours(row: pd.Series) -> float:
-    """Ideal production time required for the order (without OEE)."""
-    return (row["meters"] * row["cycle_time_sec_per_m"]) / 3600
+    """
+    Ideal production time required for the order (without OEE).
+
+    Double-width lines (see DOUBLE_WIDTH_LINES) split the web down the
+    middle after production, so the machine only has to travel half the
+    finished meters — hence the /2. This only affects *hours*; the
+    finished-meters figure (row["meters"]) is unaffected, since the
+    customer still receives the full meterage.
+    """
+    base_hours = (row["meters"] * row["cycle_time_sec_per_m"]) / 3600
+
+    if str(row.get("line", "")).strip() in DOUBLE_WIDTH_LINES:
+        return base_hours / 2
+
+    return base_hours
 
 
 def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
@@ -45,8 +109,15 @@ def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
     return orders
 
 
+# ---------------------------------------------------------------------------
+# Monthly capacity vs. demand
+# ---------------------------------------------------------------------------
+
 def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
-    """One row per (line, month): effective capacity (scaled by OEE) vs. required hours vs. utilization %."""
+    """
+    One row per (line, month): effective capacity (scaled by OEE), required
+    hours, produced meters, and utilization %.
+    """
     calendar = calendar.copy()
 
     calendar["oee"] = calendar["line"].map(oee_by_line)
@@ -58,41 +129,32 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
     demand = (
-        orders.groupby(["line", "month"])["required_hours"]
+        orders.groupby(["line", "month"])[["required_hours", "meters"]]
         .sum()
         .reset_index()
     )
     summary = calendar.merge(demand, on=["line", "month"], how="left")
     summary["required_hours"] = summary["required_hours"].fillna(0)
-    summary["utilization_pct"] = (
-        summary["required_hours"] / summary["capacity_hours"] * 100
-    )
+    summary["meters"] = summary["meters"].fillna(0)
+    summary["utilization_pct"] = _safe_pct(summary["required_hours"], summary["capacity_hours"])
     return summary.sort_values(["line", "month"]).reset_index(drop=True)
-
-
-def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{label} is missing columns: {missing}")
 
 
 def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds one 'YYYY Toplam' row per year to a monthly summary table that has
-    at least 'month', 'capacity_hours', 'required_hours'. Works for both a
-    single line's table (which also has working_days/hours_per_day) and the
-    combined all-lines table (which doesn't) — only sums columns that are
-    actually present, so it's safe to call on either shape.
+    at least 'month', 'capacity_hours', 'required_hours' (and, if present,
+    'meters').
     """
     df = monthly_df.copy()
     df["year"] = df["month"].astype(str).str.slice(0, 4)
 
-    sum_cols = [c for c in ["working_days", "capacity_hours", "required_hours"] if c in df.columns]
+    sum_cols = [c for c in ["working_days", "capacity_hours", "required_hours", "meters"] if c in df.columns]
     totals = df.groupby("year")[sum_cols].sum().reset_index()
     totals["month"] = totals["year"] + " Toplam"
     if "hours_per_day" in df.columns:
         totals["hours_per_day"] = ""
-    totals["utilization_pct"] = totals["required_hours"] / totals["capacity_hours"] * 100
+    totals["utilization_pct"] = _safe_pct(totals["required_hours"], totals["capacity_hours"])
 
     ordered_cols = ["month"] + [c for c in df.columns if c not in ("month", "year")]
     totals = totals.reindex(columns=ordered_cols, fill_value="")
@@ -100,103 +162,196 @@ def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df[ordered_cols], totals], ignore_index=True)
 
 
+def _safe_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """numerator / denominator * 100, without blowing up on zero-capacity rows."""
+    denom = denominator.replace(0, pd.NA)
+    return (numerator / denom * 100).fillna(0)
+
+
 # ---------------------------------------------------------------------------
-# Capacity holdout logic
+# Capacity holdout (customer / program level, multi-year)
 # ---------------------------------------------------------------------------
 
-REQUIRED_HOLDOUT_COLS = [
-    "order_id", "customer_plant", "internal_external", "model_key",
-    "program_carline", "unit", "width_m", "length_m", "cycle_time_sec_per_m",
-]
-HOLDOUT_YEAR_COLS = (
-    [f"vol_{y}" for y in range(2026, 2032)]
-    + [str(y) for y in range(2026, 2032)]
-    + list(range(2026, 2032))
-)
-HOLDOUT_GROUP_LABELS = {
-    "total": "Toplam (Genel Özet)",
-    "customer_plant": "Company",
-    "internal_external": "Internal / External",
-    "model_key": "Customer / Model-Key",
-    "program_carline": "Program / Carline",
-    "line": "Physical Line",
-}
+def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reshape wide holdout orders (one column per forecast year) into long
+    format, convert volume to meters, and compute required_hours using
+    compute_required_hours() — including the double-width halving.
+    """
+    orders = orders.copy()
+    orders.columns = [str(c).strip() for c in orders.columns]
+
+    if "Line No" in orders.columns and "line" not in orders.columns:
+        orders = orders.rename(columns={"Line No": "line"})
+
+    forecast_year_strs = [str(y) for y in HOLDOUT_FORECAST_YEARS]
+    year_cols = [
+        c for c in orders.columns
+        if c.startswith("vol_") or c in forecast_year_strs
+    ]
+    if not year_cols:
+        raise ValueError("No year volume columns found in file.")
+
+    id_cols = [c for c in orders.columns if c not in year_cols]
+    long_df = orders.melt(
+        id_vars=id_cols, value_vars=year_cols,
+        var_name="year", value_name="volume",
+    )
+    long_df["year"] = long_df["year"].astype(str).str.replace("vol_", "", regex=False)
+    long_df["volume"] = pd.to_numeric(long_df["volume"], errors="coerce").fillna(0)
+
+    long_df["quantity"] = long_df["volume"]
+    long_df["meters"] = long_df.apply(convert_to_meters, axis=1)
+    long_df["required_hours"] = long_df.apply(compute_required_hours, axis=1)
+
+    return long_df
 
 
-def build_holdout_summary(long_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Pivot to: rows = year, columns = group_col values, cells = required_hours."""
+def build_holdout_summary(
+    long_df: pd.DataFrame, group_col: str,
+    value_col: str = "required_hours", total_label: str = "Toplam Gereken Süre",
+) -> pd.DataFrame:
+    """
+    Pivot to: rows = year, columns = group_col values, cells = value_col
+    (either 'required_hours' or 'meters' — see HOLDOUT_METRICS).
+    """
     grouped = long_df.copy()
 
     if group_col == "total":
-        pivot = grouped.groupby("year")["required_hours"].sum().to_frame(name="Toplam Gereken Süre")
+        pivot = grouped.groupby("year")[value_col].sum().to_frame(name=total_label)
         return pivot.sort_index()
 
     if group_col not in grouped.columns:
         raise ValueError(f"Unknown grouping column: {group_col}")
 
-    # Normalize the grouping column so values that only differ by stray
-    # whitespace or by being stored as text vs. number in Excel (e.g.
-    # "356" and "356 ") don't show up as separate, duplicate-looking groups.
-    grouped[group_col] = (
-        grouped[group_col].fillna("Unspecified").astype(str).str.strip()
-    )
+    grouped[group_col] = grouped[group_col].fillna("Unspecified").astype(str).str.strip()
 
     pivot = grouped.pivot_table(
-        index="year", columns=group_col, values="required_hours",
+        index="year", columns=group_col, values=value_col,
         aggfunc="sum", fill_value=0,
     )
     return pivot.sort_index()
 
 
-def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
+def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame):
     """
-    Reshape wide holdout orders into long format, convert each row's volume
-    to meters (reuses the SAME convert_to_meters logic as the line-level
-    planner, so M/M2/PCS/ADT behave identically here), then compute
-    required_hours from cycle_time_sec_per_m — seconds to produce 1 meter.
+    Reconcile the regular orders file with the holdout forecast.
 
-    No OEE here, on purpose: OEE is applied exactly once, on the capacity
-    side, in compute_annual_capacity_from_calendar. Dividing demand by OEE
-    here too would double-count it (once shrinking capacity, once
-    inflating demand), which overstates utilization.
+    Two things happen here:
+
+    1. Multi-line split: if an order_id appears against a single line in
+       orders_df but against multiple lines in holdout_df (e.g. a
+       sandwich/double-layer product produced partly on TRK0001 and partly
+       on TRK0002), this duplicates that order row once per line the
+       holdout lists. Each copy carries the order's full quantity —
+       that's intentional: the holdout's per-line rows already represent
+       that line's full run, not a split of one shared quantity.
+
+    2. Cycle-time standardization: holdout is treated as the source of
+       truth for cycle_time_sec_per_m. Wherever an order_id also appears
+       in the holdout file, the holdout's cycle_time_sec_per_m overrides
+       whatever value is in the orders file, *if the two differ*. Every
+       such override is recorded so the caller can show the user what
+       changed and why — nothing is silently altered.
+
+    Orders whose order_id doesn't appear in holdout at all are left
+    completely untouched, keeping their own cycle_time_sec_per_m.
+
+    Returns:
+        (aligned_orders_df, overrides_df) — overrides_df has one row per
+        order_id/line whose cycle_time_sec_per_m was replaced, with columns
+        order_id, line, eski_cycle_time, yeni_cycle_time. Empty if none.
     """
-    orders = orders.copy()
-    orders.columns = [str(c) for c in orders.columns]
+    orders = orders_df.copy()
+    holdout = holdout_df.copy()
 
-    year_cols = [c for c in orders.columns if c.startswith("vol_") or c in [str(y) for y in range(2026, 2032)]]
-    if not year_cols:
-        raise ValueError("No year volume columns found in file.")
+    if "Line No" in holdout.columns and "line" not in holdout.columns:
+        holdout = holdout.rename(columns={"Line No": "line"})
 
-    id_cols = [c for c in orders.columns if c not in year_cols]
-    long_df = orders.melt(id_vars=id_cols, value_vars=year_cols,
-                           var_name="year", value_name="volume")
-    long_df["year"] = long_df["year"].astype(str).str.replace("vol_", "", regex=False)
-    long_df["volume"] = pd.to_numeric(long_df["volume"], errors="coerce").fillna(0)
+    if "line" not in holdout.columns:
+        return orders, pd.DataFrame(columns=["order_id", "line", "eski_cycle_time", "yeni_cycle_time"])
 
-    # convert_to_meters expects a 'quantity' column (and only uses 'order_id'
-    # for error messages) — map volume onto it so M/M2/PCS/ADT all convert
-    # the same way here as they do in the line-level planner.
-    long_df["quantity"] = long_df["volume"]
-    long_df["meters"] = long_df.apply(convert_to_meters, axis=1)
+    has_holdout_cycle_time = "cycle_time_sec_per_m" in holdout.columns
 
-    long_df["required_hours"] = (long_df["meters"] * long_df["cycle_time_sec_per_m"]) / 3600
+    def _apply_cycle_time_override(row_copy: dict, h_row: pd.Series, overrides: list) -> None:
+        """Mutates row_copy in place, appending to overrides if the value actually changed."""
+        if not has_holdout_cycle_time or pd.isna(h_row.get("cycle_time_sec_per_m")):
+            return
+        new_ct = float(h_row["cycle_time_sec_per_m"])
+        old_ct = row_copy.get("cycle_time_sec_per_m")
+        if pd.isna(old_ct) or float(old_ct) != new_ct:
+            overrides.append({
+                "order_id": row_copy.get("order_id"),
+                "line": row_copy.get("line"),
+                "eski_cycle_time": old_ct,
+                "yeni_cycle_time": new_ct,
+            })
+        row_copy["cycle_time_sec_per_m"] = new_ct
 
-    return long_df
+    aligned_rows = []
+    overrides: list = []
+
+    for order_id, group in orders.groupby("order_id"):
+        matching_holdout = holdout[holdout["order_id"] == order_id]
+
+        if matching_holdout.empty:
+            aligned_rows.extend(group.to_dict("records"))
+            continue
+
+        if len(matching_holdout) > 1 and "line" in matching_holdout.columns:
+            # Multi-line split: one duplicated row per holdout line, each
+            # taking that line's own cycle time.
+            for _, h_row in matching_holdout.iterrows():
+                row_copy = group.iloc[0].to_dict()
+                row_copy["line"] = h_row["line"]
+                _apply_cycle_time_override(row_copy, h_row, overrides)
+                aligned_rows.append(row_copy)
+        else:
+            # Single-line match: keep the order row(s) as-is except for a
+            # possible cycle-time override from holdout.
+            h_row = matching_holdout.iloc[0]
+            for _, o_row in group.iterrows():
+                row_copy = o_row.to_dict()
+                _apply_cycle_time_override(row_copy, h_row, overrides)
+                aligned_rows.append(row_copy)
+
+    aligned_df = pd.DataFrame(aligned_rows)
+    overrides_df = pd.DataFrame(overrides, columns=["order_id", "line", "eski_cycle_time", "yeni_cycle_time"])
+    return aligned_df, overrides_df
 
 
 def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
     """
-    Per (line, year): capacity_hours, built from the calendar's 'month'
-    column (e.g. '2027-01'). Returns a DataFrame — not a flat dict — so
-    each line's own capacity can be plotted separately, and each year
-    reflects its own actual working days/hours instead of one averaged
-    total reused everywhere.
+    Yearly capacity per line, extended out across HOLDOUT_FORECAST_YEARS.
+
+    Lines with calendar data for a given year use that year's actual
+    total; lines missing a year (e.g. no calendar rows entered yet for
+    2029+) fall back to that line's overall calendar total as a stand-in
+    estimate.
     """
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
+
     if df["oee"].isna().any():
         missing = df[df["oee"].isna()]["line"].unique()
-        raise ValueError(f"Missing OEE for line(s): {missing}")
+        raise ValueError(f"OEE eksik olan hat(lar): {missing}")
+
     df["capacity_hours"] = df["working_days"] * df["hours_per_day"] * df["oee"]
     df["year"] = df["month"].astype(str).str.slice(0, 4)
-    return df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
+
+    annual_by_line = df.groupby(["line", "year"])["capacity_hours"].sum().reset_index()
+
+    all_lines = list(oee_by_line.keys())
+    all_years = [str(y) for y in HOLDOUT_FORECAST_YEARS]
+
+    records = []
+    for line in all_lines:
+        line_data = annual_by_line[annual_by_line["line"] == line]
+        fallback_cap = line_data["capacity_hours"].sum() if not line_data.empty else 0.0
+
+        for year in all_years:
+            match = line_data[line_data["year"] == year]
+            value = match["capacity_hours"].values[0] if not match.empty else fallback_cap
+            records.append({"line": line, "year": year, "capacity_hours": value})
+
+    return pd.DataFrame(records)
