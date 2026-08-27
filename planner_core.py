@@ -32,15 +32,12 @@ HOLDOUT_GROUP_LABELS = {
     "line": "Physical Line",
 }
 
-# value_col options for the holdout pivot/summary — hours, meters, or m².
 HOLDOUT_METRICS = {
     "required_hours": {"label": "Süre (Saat)", "unit": "sa", "total_label": "Toplam Gereken Süre"},
     "meters": {"label": "Üretim (Metre)", "unit": "m", "total_label": "Toplam Üretilen Metre"},
     "m2": {"label": "Üretim (m²)", "unit": "m²", "total_label": "Toplam Üretilen m²"},
 }
 
-# Lines that run double-width material and slit it into two strips, so one
-# meter of machine travel yields two meters of finished product.
 DOUBLE_WIDTH_LINES = {"TRK0002"}
 
 HOLDOUT_FORECAST_YEARS = range(2026, 2032)
@@ -58,7 +55,7 @@ def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Orders -> required hours / meters
+# Orders -> required hours / meters / m2
 # ---------------------------------------------------------------------------
 
 def convert_to_meters(row: pd.Series) -> float:
@@ -83,7 +80,12 @@ def convert_to_meters(row: pd.Series) -> float:
 
 
 def convert_to_m2(row: pd.Series) -> float:
-    """Turn one order's quantity into square meters (finished area), based on unit."""
+    """
+    Turn one order's quantity into square meters (finished area), based on unit.
+    - M2: quantity is already an area.
+    - M: quantity * width_m.
+    - ADT / PCS: quantity * length_m * width_m.
+    """
     unit = str(row.get("unit", "")).strip().upper()
     qty = row["quantity"]
 
@@ -131,9 +133,9 @@ def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
 def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
     """
     One row per (line, month): effective capacity (scaled by OEE), required
-    hours, produced meters, produced m², and utilization %.
-    For m² and meters, identical order_ids across lines are deduplicated per line/month 
-    to prevent duplicate volume accumulation.
+    hours, produced meters, and produced m².
+    Meters and required hours account for line distribution, 
+    while m² (finished shipment area) deduplicates sandwich/shared order references.
     """
     calendar = calendar.copy()
 
@@ -145,21 +147,22 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["gross_capacity_hours"] = calendar["working_days"] * calendar["hours_per_day"]
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
-    demand_hours = (
-        orders.groupby(["line", "month"])["required_hours"]
+    # Required hours and meters are summed per line/month (since meters/hours apply to line load)
+    demand_hours_meters = (
+        orders.groupby(["line", "month"])[["required_hours", "meters"]]
         .sum()
         .reset_index()
     )
 
-    # Deduplicate order_id per line/month for physical dimensions (m2/meters)
-    orders_unique_metric = orders.drop_duplicates(subset=["order_id", "line", "month"])
-    demand_metrics = (
-        orders_unique_metric.groupby(["line", "month"])[["meters", "m2"]]
+    # For m2 (shipped area), sandwich orders split across lines should only be counted once per order_id per month
+    orders_unique_m2 = orders.drop_duplicates(subset=["order_id", "month"])
+    demand_m2 = (
+        orders_unique_m2.groupby(["line", "month"])["m2"]
         .sum()
         .reset_index()
     )
 
-    demand = pd.merge(demand_hours, demand_metrics, on=["line", "month"], how="outer")
+    demand = pd.merge(demand_hours_meters, demand_m2, on=["line", "month"], how="outer")
 
     summary = calendar.merge(demand, on=["line", "month"], how="left")
     summary["required_hours"] = summary["required_hours"].fillna(0)
@@ -234,20 +237,16 @@ def build_holdout_summary(
 ) -> pd.DataFrame:
     """
     Pivot holdout summary table. 
-    For meters and m2, duplicate order_ids across lines are strictly filtered out 
-    so that shared/sandwich parts are counted as a single volume reference.
+    For m2, shared sandwich order references across lines are deduplicated per year 
+    so physical shipments match single-shipment budget realities.
     """
     grouped = long_df.copy()
 
-    # If calculating physical dimensions (meters or m2), drop duplicate order_id references per year 
-    # to ensure identical orders across different lines don't inflate total shipments/m2.
-    if value_col in ["meters", "m2"]:
+    # If calculating m2, deduplicate sandwich orders across lines per year to avoid double counting shipments
+    if value_col == "m2":
         if group_col == "line":
-            # Per line breakdown: keep unique order_id per line per year
             grouped = grouped.drop_duplicates(subset=["year", "order_id", "line"])
         else:
-            # For general summaries or grouped categories (total, customer, etc.), 
-            # take a single reference volume per order_id per year across lines.
             grouped = grouped.drop_duplicates(subset=["year", "order_id"])
 
     if group_col == "total":
