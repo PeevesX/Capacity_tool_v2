@@ -32,10 +32,11 @@ HOLDOUT_GROUP_LABELS = {
     "line": "Physical Line",
 }
 
-# value_col options for the holdout pivot/summary — hours or meters.
+# value_col options for the holdout pivot/summary — hours, meters, or m².
 HOLDOUT_METRICS = {
     "required_hours": {"label": "Süre (Saat)", "unit": "sa", "total_label": "Toplam Gereken Süre"},
     "meters": {"label": "Üretim (Metre)", "unit": "m", "total_label": "Toplam Üretilen Metre"},
+    "m2": {"label": "Üretim (m²)", "unit": "m²", "total_label": "Toplam Üretilen m²"},
 }
 
 # Lines that run double-width material and slit it into two strips, so one
@@ -83,6 +84,36 @@ def convert_to_meters(row: pd.Series) -> float:
     raise ValueError(f"{row.get('order_id', '?')}: unknown unit '{unit}'")
 
 
+def convert_to_m2(row: pd.Series) -> float:
+    """
+    Turn one order's quantity into square meters (finished area), based on unit.
+
+    - M2: quantity is already an area — used as-is.
+    - M: quantity is a length, so multiply by width_m to get area.
+    - PCS / ADT: quantity is a piece count, so multiply by length_m * width_m
+      (each piece's own area) to get total area.
+    """
+    unit = str(row.get("unit", "")).strip().upper()
+    qty = row["quantity"]
+
+    if unit == "M2":
+        return qty
+
+    if unit == "M":
+        if pd.isna(row["width_m"]) or row["width_m"] == 0:
+            raise ValueError(f"{row.get('order_id', '?')}: {unit} order needs width_m for m² conversion")
+        return qty * row["width_m"]
+
+    if unit in ("PCS", "ADT"):
+        if pd.isna(row["length_m"]) or row["length_m"] == 0:
+            raise ValueError(f"{row.get('order_id', '?')}: {unit} order needs length_m for m² conversion")
+        if pd.isna(row["width_m"]) or row["width_m"] == 0:
+            raise ValueError(f"{row.get('order_id', '?')}: {unit} order needs width_m for m² conversion")
+        return qty * row["length_m"] * row["width_m"]
+
+    raise ValueError(f"{row.get('order_id', '?')}: unknown unit '{unit}'")
+
+
 def compute_required_hours(row: pd.Series) -> float:
     """
     Ideal production time required for the order (without OEE).
@@ -102,9 +133,10 @@ def compute_required_hours(row: pd.Series) -> float:
 
 
 def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
-    """Add meters + required_hours columns to a raw orders dataframe."""
+    """Add meters + m2 + required_hours columns to a raw orders dataframe."""
     orders = orders.copy()
     orders["meters"] = orders.apply(convert_to_meters, axis=1)
+    orders["m2"] = orders.apply(convert_to_m2, axis=1)
     orders["required_hours"] = orders.apply(compute_required_hours, axis=1)
     return orders
 
@@ -116,7 +148,7 @@ def process_orders(orders: pd.DataFrame) -> pd.DataFrame:
 def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
     """
     One row per (line, month): effective capacity (scaled by OEE), required
-    hours, produced meters, and utilization %.
+    hours, produced meters, produced m², and utilization %.
     """
     calendar = calendar.copy()
 
@@ -129,13 +161,14 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
     demand = (
-        orders.groupby(["line", "month"])[["required_hours", "meters"]]
+        orders.groupby(["line", "month"])[["required_hours", "meters", "m2"]]
         .sum()
         .reset_index()
     )
     summary = calendar.merge(demand, on=["line", "month"], how="left")
     summary["required_hours"] = summary["required_hours"].fillna(0)
     summary["meters"] = summary["meters"].fillna(0)
+    summary["m2"] = summary["m2"].fillna(0)
     summary["utilization_pct"] = _safe_pct(summary["required_hours"], summary["capacity_hours"])
     return summary.sort_values(["line", "month"]).reset_index(drop=True)
 
@@ -144,12 +177,12 @@ def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds one 'YYYY Toplam' row per year to a monthly summary table that has
     at least 'month', 'capacity_hours', 'required_hours' (and, if present,
-    'meters').
+    'meters' / 'm2').
     """
     df = monthly_df.copy()
     df["year"] = df["month"].astype(str).str.slice(0, 4)
 
-    sum_cols = [c for c in ["working_days", "capacity_hours", "required_hours", "meters"] if c in df.columns]
+    sum_cols = [c for c in ["working_days", "capacity_hours", "required_hours", "meters", "m2"] if c in df.columns]
     totals = df.groupby("year")[sum_cols].sum().reset_index()
     totals["month"] = totals["year"] + " Toplam"
     if "hours_per_day" in df.columns:
@@ -175,8 +208,8 @@ def _safe_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
 def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
     """
     Reshape wide holdout orders (one column per forecast year) into long
-    format, convert volume to meters, and compute required_hours using
-    compute_required_hours() — including the double-width halving.
+    format, convert volume to meters and m², and compute required_hours
+    using compute_required_hours() — including the double-width halving.
     """
     orders = orders.copy()
     orders.columns = [str(c).strip() for c in orders.columns]
@@ -202,6 +235,7 @@ def process_holdout_orders(orders: pd.DataFrame) -> pd.DataFrame:
 
     long_df["quantity"] = long_df["volume"]
     long_df["meters"] = long_df.apply(convert_to_meters, axis=1)
+    long_df["m2"] = long_df.apply(convert_to_m2, axis=1)
     long_df["required_hours"] = long_df.apply(compute_required_hours, axis=1)
 
     return long_df
@@ -213,7 +247,7 @@ def build_holdout_summary(
 ) -> pd.DataFrame:
     """
     Pivot to: rows = year, columns = group_col values, cells = value_col
-    (either 'required_hours' or 'meters' — see HOLDOUT_METRICS).
+    ('required_hours', 'meters', or 'm2' — see HOLDOUT_METRICS).
     """
     grouped = long_df.copy()
 

@@ -106,13 +106,13 @@ def capacity_vs_demand_chart(
     return fig
 
 
-def production_meters_chart(df: pd.DataFrame, title: str, color: str = "#2E8B57") -> go.Figure:
-    """Simple bar chart of produced meters per month, with the value labeled on each bar."""
+def value_bar_chart(df: pd.DataFrame, value_col: str, series_name: str, title: str, color: str) -> go.Figure:
+    """Simple bar chart of one value column per month, with the value labeled on each bar."""
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=df["month"], y=df["meters"], name="Üretilen Metre",
+        x=df["month"], y=df[value_col], name=series_name,
         marker_color=color,
-        text=[f"{v:,.0f}" for v in df["meters"]],
+        text=[f"{v:,.0f}" for v in df[value_col]],
         textposition="outside",
     ))
     fig.update_layout(
@@ -121,7 +121,7 @@ def production_meters_chart(df: pd.DataFrame, title: str, color: str = "#2E8B57"
         showlegend=False,
     )
     fig.update_xaxes(type="category", tickmode="linear")
-    fig.update_yaxes(title_text="Metre")
+    fig.update_yaxes(title_text=series_name)
     return fig
 
 
@@ -228,7 +228,7 @@ except Exception as e:
 
 # Aggregate across all lines, per month, for the combined tab
 total_summary = (
-    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours", "meters"]].sum()
+    summary.groupby("month", as_index=False)[["capacity_hours", "required_hours", "meters", "m2"]].sum()
 )
 total_summary["utilization_pct"] = (
     total_summary["required_hours"] / total_summary["capacity_hours"] * 100
@@ -255,12 +255,14 @@ with tabs[0]:
                 "capacity_hours": "Toplam Kapasite Saatleri",
                 "required_hours": "Toplam Gereken Süre",
                 "meters": "Üretilen Metre",
+                "m2": "Üretilen m²",
                 "utilization_pct": "Ortalama Doluluk %",
             },
             number_formats={
                 "Toplam Kapasite Saatleri": "{:.0f}",
                 "Toplam Gereken Süre": "{:.1f}",
                 "Üretilen Metre": "{:,.0f}",
+                "Üretilen m²": "{:,.0f}",
                 "Ortalama Doluluk %": "{:.1f}%",
             },
         )
@@ -272,10 +274,17 @@ with tabs[0]:
         )
         st.plotly_chart(fig_tot, width="stretch")
 
-    st.plotly_chart(
-        production_meters_chart(total_summary, "Tüm Hatlar Toplamı: Üretilen Metre"),
-        width="stretch",
-    )
+    col_meters_chart, col_m2_chart = st.columns(2)
+    with col_meters_chart:
+        st.plotly_chart(
+            value_bar_chart(total_summary, "meters", "Üretilen Metre", "Tüm Hatlar Toplamı: Üretilen Metre", "#2E8B57"),
+            width="stretch",
+        )
+    with col_m2_chart:
+        st.plotly_chart(
+            value_bar_chart(total_summary, "m2", "Üretilen m²", "Tüm Hatlar Toplamı: Üretilen m²", "#8A2BE2"),
+            width="stretch",
+        )
 
     st.download_button(
         label="Tüm hatlar özetini CSV olarak indir",
@@ -304,12 +313,14 @@ for tab, line in zip(tabs[1:-1], lines):
                     "capacity_hours": "Kapasite Saatleri",
                     "required_hours": "Gereken Süre",
                     "meters": "Üretilen Metre",
+                    "m2": "Üretilen m²",
                     "utilization_pct": "Doluluk %",
                 },
                 number_formats={
                     "Kapasite Saatleri": "{:.0f}",
                     "Gereken Süre": "{:.1f}",
                     "Üretilen Metre": "{:,.0f}",
+                    "Üretilen m²": "{:,.0f}",
                     "Doluluk %": "{:.1f}%",
                 },
             )
@@ -318,10 +329,17 @@ for tab, line in zip(tabs[1:-1], lines):
             fig = capacity_vs_demand_chart(line_summary, f"{line}: Kapasite vs Gereken Süre")
             st.plotly_chart(fig, width="stretch")
 
-        st.plotly_chart(
-            production_meters_chart(line_summary, f"{line}: Üretilen Metre"),
-            width="stretch",
-        )
+        col_meters_chart, col_m2_chart = st.columns(2)
+        with col_meters_chart:
+            st.plotly_chart(
+                value_bar_chart(line_summary, "meters", "Üretilen Metre", f"{line}: Üretilen Metre", "#2E8B57"),
+                width="stretch",
+            )
+        with col_m2_chart:
+            st.plotly_chart(
+                value_bar_chart(line_summary, "m2", "Üretilen m²", f"{line}: Üretilen m²", "#8A2BE2"),
+                width="stretch",
+            )
 
         st.download_button(
             label=f"Download {line} summary as CSV",
