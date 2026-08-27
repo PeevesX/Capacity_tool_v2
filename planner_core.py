@@ -132,8 +132,8 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     """
     One row per (line, month): effective capacity (scaled by OEE), required
     hours, produced meters, produced m², and utilization %.
-    For m² and meters on shared/sandwich orders split across lines, 
-    duplicate order references are handled so physical shipment totals remain correct.
+    For m² and meters, identical order_ids across lines are deduplicated per line/month 
+    to prevent duplicate volume accumulation.
     """
     calendar = calendar.copy()
 
@@ -145,15 +145,13 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["gross_capacity_hours"] = calendar["working_days"] * calendar["hours_per_day"]
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
-    # For required_hours, sum normally per line & month
     demand_hours = (
         orders.groupby(["line", "month"])["required_hours"]
         .sum()
         .reset_index()
     )
 
-    # For meters and m2, if an order_id appears multiple times across lines (sandwiches), 
-    # take unique order values per line or drop duplicates for physical shipment summation
+    # Deduplicate order_id per line/month for physical dimensions (m2/meters)
     orders_unique_metric = orders.drop_duplicates(subset=["order_id", "line", "month"])
     demand_metrics = (
         orders_unique_metric.groupby(["line", "month"])[["meters", "m2"]]
@@ -234,12 +232,23 @@ def build_holdout_summary(
     long_df: pd.DataFrame, group_col: str,
     value_col: str = "required_hours", total_label: str = "Toplam Gereken Süre",
 ) -> pd.DataFrame:
-    """Pivot holdout summary table."""
+    """
+    Pivot holdout summary table. 
+    For meters and m2, duplicate order_ids across lines are strictly filtered out 
+    so that shared/sandwich parts are counted as a single volume reference.
+    """
     grouped = long_df.copy()
 
-    if value_col in ["meters", "m2"] and "order_id" in grouped.columns:
-        # For physical shipment metrics on holdout/sandwiches, avoid double counting duplicate references if split
-        grouped = grouped.drop_duplicates(subset=["year", "order_id", group_col] if group_col != "total" else ["year", "order_id"])
+    # If calculating physical dimensions (meters or m2), drop duplicate order_id references per year 
+    # to ensure identical orders across different lines don't inflate total shipments/m2.
+    if value_col in ["meters", "m2"]:
+        if group_col == "line":
+            # Per line breakdown: keep unique order_id per line per year
+            grouped = grouped.drop_duplicates(subset=["year", "order_id", "line"])
+        else:
+            # For general summaries or grouped categories (total, customer, etc.), 
+            # take a single reference volume per order_id per year across lines.
+            grouped = grouped.drop_duplicates(subset=["year", "order_id"])
 
     if group_col == "total":
         pivot = grouped.groupby("year")[value_col].sum().to_frame(name=total_label)
