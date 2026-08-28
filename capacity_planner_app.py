@@ -9,15 +9,16 @@ from planner_core import (
     REQUIRED_CALENDAR_COLS,
     REQUIRED_HOLDOUT_COLS,
     REQUIRED_ORDER_COLS,
-    align_orders_with_holdout,
     append_year_totals,
     build_holdout_summary,
     build_monthly_summary,
     compute_annual_capacity_from_calendar,
+    load_wide_orders,
     process_holdout_orders,
     process_orders,
     validate_columns,
 )
+
 
 st.set_page_config(page_title="Tarak Hattı Fizibilite Planlayıcı", layout="wide")
 
@@ -142,9 +143,10 @@ calendar_file = st.sidebar.file_uploader(
     type=["xlsx", "csv"],
 )
 orders_file = st.sidebar.file_uploader(
-    "Siparişler (sipariş no, ürün, hat, ay, birim, miktar, genişlik(m), uzunluk(m), metre_başına_çevrim_süresi(sn))",
+    "Siparişler (GPN, GPN Description, Line No, UNIT TR, Part volume-M{ay}{yıl}, cycle_time_sec_per_m, width_m, length_m)",
     type=["xlsx", "csv"],
 )
+
 
 st.sidebar.header("2. Hat OEE Değerlerini Girin")
 st.sidebar.caption("Algılanan hatlar için OEE değerleri dosyadan otomatik olarak doldurulur.")
@@ -155,7 +157,8 @@ if not calendar_file or not orders_file:
 
 try:
     calendar_df = read_any(calendar_file)
-    orders_df = read_any(orders_file)
+    orders_raw = read_any(orders_file)
+    orders_df = load_wide_orders(orders_raw)
     validate_columns(calendar_df, REQUIRED_CALENDAR_COLS, "Calendar file")
     validate_columns(orders_df, REQUIRED_ORDER_COLS, "Orders file")
 except Exception as e:
@@ -173,14 +176,7 @@ holdout_file = st.sidebar.file_uploader(
     type=["xlsx", "csv"],
 )
 
-cycle_time_overrides = pd.DataFrame(columns=["order_id", "line", "eski_cycle_time", "yeni_cycle_time"])
 
-if holdout_file:
-    try:
-        holdout_raw_check = read_any(holdout_file)
-        orders_df, cycle_time_overrides = align_orders_with_holdout(orders_df, holdout_raw_check)
-    except Exception as e:
-        st.sidebar.warning(f"Sipariş/holdout hat eşleştirmesi atlandı: {e}")
 
 lines = sorted(orders_df["line"].dropna().unique())
 if not lines:
@@ -198,20 +194,6 @@ oee_by_line = {
 # Data preview
 # ---------------------------------------------------------------------------
 
-if not cycle_time_overrides.empty:
-    with st.expander(
-        f"⚠️ Holdout dosyasından {len(cycle_time_overrides)} adet çevrim süresi (cycle_time_sec_per_m) güncellendi",
-        expanded=False,
-    ):
-        st.dataframe(
-            cycle_time_overrides.rename(columns={
-                "order_id": "Sipariş No",
-                "line": "Hat",
-                "eski_cycle_time": "Eski Çevrim Süresi (sn/m)",
-                "yeni_cycle_time": "Yeni Çevrim Süresi (sn/m, Holdout)",
-            }),
-            width="stretch",
-        )
 
 with st.expander("Önizleme: Takvim ve Siparişler"):
     c1, c2 = st.columns(2)

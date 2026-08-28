@@ -6,6 +6,8 @@ Nothing in this module touches Streamlit — it's pure pandas so it can be
 unit-tested and reused outside the app.
 """
 
+import re
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,71 @@ def validate_columns(df: pd.DataFrame, required: list, label: str) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{label} is missing columns: {missing}")
+
+
+# ---------------------------------------------------------------------------
+# Wide-format orders file (GPN-based, one row per GPN+Line, monthly volume
+# columns named "Part volume-M{ay}{yıl}", e.g. "Part volume-12027" = Jan 2027)
+# ---------------------------------------------------------------------------
+
+WIDE_ORDERS_VOLUME_PATTERN = re.compile(r"^Part volume-(\d{1,2})(\d{4})$")
+
+
+def load_wide_orders(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert the GPN-based wide orders file into the long (order_id,
+    product, line, month, unit, quantity, width_m, length_m,
+    cycle_time_sec_per_m) shape the rest of this module expects.
+
+    Each row already carries its own line, unit, width_m, length_m, and
+    cycle_time_sec_per_m — if a GPN genuinely runs on both TRK0001 and
+    TRK0002, the file simply has two rows for it, each with that line's
+    own cycle time. No separate holdout-alignment step is needed to
+    infer this (see align_orders_with_holdout, now unused for this).
+
+    Numeric volume cells that come through as text/oddly formatted are
+    coerced to numbers; anything that still can't be read as a number
+    becomes 0 rather than raising, since a handful of stray formatting
+    quirks shouldn't block the whole file from loading.
+    """
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map = {}
+    if "Line No" in df.columns:
+        rename_map["Line No"] = "line"
+    for cand in ("UNIT\nTR", "UNIT TR"):
+        if cand in df.columns:
+            rename_map[cand] = "unit"
+            break
+    if "GPN" in df.columns:
+        rename_map["GPN"] = "order_id"
+    if "GPN Description" in df.columns:
+        rename_map["GPN Description"] = "product"
+    df = df.rename(columns=rename_map)
+
+    volume_cols = [c for c in df.columns if WIDE_ORDERS_VOLUME_PATTERN.match(c)]
+    if not volume_cols:
+        raise ValueError("No 'Part volume-M{ay}{yıl}' columns found in file.")
+
+    id_cols = [c for c in df.columns if c not in volume_cols]
+    long_df = df.melt(
+        id_vars=id_cols, value_vars=volume_cols,
+        var_name="_volcol", value_name="quantity",
+    )
+
+    def _parse_month(colname: str) -> str:
+        m = WIDE_ORDERS_VOLUME_PATTERN.match(colname)
+        month_num, year = int(m.group(1)), m.group(2)
+        return f"{year}-{month_num:02d}"
+
+    long_df["month"] = long_df["_volcol"].apply(_parse_month)
+    long_df = long_df.drop(columns=["_volcol"])
+
+    long_df["quantity"] = pd.to_numeric(long_df["quantity"], errors="coerce").fillna(0)
+    long_df["order_id"] = long_df["order_id"].astype(str)
+
+    return long_df
 
 
 # ---------------------------------------------------------------------------
