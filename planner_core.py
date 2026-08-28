@@ -38,6 +38,10 @@ HOLDOUT_METRICS = {
     "m2": {"label": "Üretim (m²)", "unit": "m²", "total_label": "Toplam Üretilen m²"},
 }
 
+# Lines that run double-width material and slit it into two strips, so one
+# meter of machine travel yields two meters of finished product.
+# Add a line code here (e.g. "TRK0003") if another double-width line is
+# introduced later — nothing else in this file needs to change.
 DOUBLE_WIDTH_LINES = {"TRK0002"}
 
 HOLDOUT_FORECAST_YEARS = range(2026, 2032)
@@ -108,7 +112,15 @@ def convert_to_m2(row: pd.Series) -> float:
 
 
 def compute_required_hours(row: pd.Series) -> float:
-    """Ideal production time required for the order (without OEE)."""
+    """
+    Ideal production time required for the order (without OEE).
+
+    Double-width lines (see DOUBLE_WIDTH_LINES) split the web down the
+    middle after production, so the machine only has to travel half the
+    finished meters — hence the /2. This only affects *hours*; the
+    finished-meters figure (row["meters"]) is unaffected, since the
+    customer still receives the full meterage.
+    """
     base_hours = (row["meters"] * row["cycle_time_sec_per_m"]) / 3600
 
     if str(row.get("line", "")).strip() in DOUBLE_WIDTH_LINES:
@@ -134,8 +146,13 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     """
     One row per (line, month): effective capacity (scaled by OEE), required
     hours, produced meters, and produced m².
-    Meters and required hours account for line distribution, 
-    while m² (finished shipment area) deduplicates sandwich/shared order references.
+
+    Required hours and meters are summed per (line, month) as-is, since
+    each line's row reflects that line's own real machine load. m² (the
+    physically shipped area) is deduplicated by (order_id, month) BEFORE
+    the per-line grouping — a sandwich order duplicated across two lines
+    (see align_orders_with_holdout) still ships as ONE m², so only one of
+    its duplicate rows should contribute to the m² total.
     """
     calendar = calendar.copy()
 
@@ -147,15 +164,13 @@ def build_monthly_summary(orders: pd.DataFrame, calendar: pd.DataFrame, oee_by_l
     calendar["gross_capacity_hours"] = calendar["working_days"] * calendar["hours_per_day"]
     calendar["capacity_hours"] = calendar["gross_capacity_hours"] * calendar["oee"]
 
-    # Required hours and meters are summed per line/month (since meters/hours apply to line load)
     demand_hours_meters = (
         orders.groupby(["line", "month"])[["required_hours", "meters"]]
         .sum()
         .reset_index()
     )
 
-    # For m2 (shipped area), sandwich orders split across lines should only be counted once per order_id per month
-    orders_unique_m2 = orders.drop_duplicates(subset=["order_id", "month"])
+    orders_unique_m2 = orders.drop_duplicates(subset=["order_id", "month"], keep="first")
     demand_m2 = (
         orders_unique_m2.groupby(["line", "month"])["m2"]
         .sum()
@@ -191,6 +206,7 @@ def append_year_totals(monthly_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _safe_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """numerator / denominator * 100, without blowing up on zero-capacity rows."""
     denom = denominator.replace(0, pd.NA)
     return (numerator / denom * 100).fillna(0)
 
@@ -236,18 +252,26 @@ def build_holdout_summary(
     value_col: str = "required_hours", total_label: str = "Toplam Gereken Süre",
 ) -> pd.DataFrame:
     """
-    Pivot holdout summary table. 
-    For m2, shared sandwich order references across lines are deduplicated per year 
-    so physical shipments match single-shipment budget realities.
+    Pivot to: rows = year, columns = group_col values, cells = value_col
+    ('required_hours', 'meters', or 'm2' — see HOLDOUT_METRICS).
+
+    For m2 (shipped area), a sandwich order duplicated across two lines
+    (see align_orders_with_holdout) still ships as ONE m² of finished
+    product — so it's deduplicated by (year, order_id) BEFORE any
+    grouping happens, regardless of what group_col is. This deliberately
+    does NOT include 'line' in the dedup subset: doing so would make the
+    dedup a no-op whenever group_col == 'line', since (year, order_id,
+    line) is already unique per row by construction — line is exactly
+    what differs between the two duplicate rows. (That was the earlier
+    bug: m² still doubled specifically when grouping by Physical Line.)
+
+    required_hours is NOT deduplicated: each line's row reflects that
+    line's own real, separate machine time, and both genuinely occur.
     """
     grouped = long_df.copy()
 
-    # If calculating m2, deduplicate sandwich orders across lines per year to avoid double counting shipments
-    if value_col == "m2":
-        if group_col == "line":
-            grouped = grouped.drop_duplicates(subset=["year", "order_id", "line"])
-        else:
-            grouped = grouped.drop_duplicates(subset=["year", "order_id"])
+    if value_col == "m2" and "order_id" in grouped.columns:
+        grouped = grouped.drop_duplicates(subset=["year", "order_id"], keep="first")
 
     if group_col == "total":
         pivot = grouped.groupby("year")[value_col].sum().to_frame(name=total_label)
@@ -266,7 +290,24 @@ def build_holdout_summary(
 
 
 def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame):
-    """Reconcile regular orders with holdout forecast and standardize cycle times."""
+    """
+    Reconcile the regular orders file with the holdout forecast.
+
+    1. Multi-line split: if an order_id appears against a single line in
+       orders_df but against multiple lines in holdout_df (e.g. a
+       sandwich/double-layer product produced partly on TRK0001 and partly
+       on TRK0002), this duplicates that order row once per line the
+       holdout lists. Each copy carries the order's full quantity.
+
+    2. Cycle-time standardization: holdout is treated as the source of
+       truth for cycle_time_sec_per_m. Wherever an order_id also appears
+       in the holdout file, the holdout's cycle_time_sec_per_m overrides
+       whatever value is in the orders file, if the two differ. Every
+       such override is recorded so the caller can show what changed.
+
+    Returns:
+        (aligned_orders_df, overrides_df)
+    """
     orders = orders_df.copy()
     holdout = holdout_df.copy()
 
@@ -321,7 +362,13 @@ def align_orders_with_holdout(orders_df: pd.DataFrame, holdout_df: pd.DataFrame)
 
 
 def compute_annual_capacity_from_calendar(calendar_df: pd.DataFrame, oee_by_line: dict) -> pd.DataFrame:
-    """Yearly capacity per line extended across HOLDOUT_FORECAST_YEARS."""
+    """
+    Yearly capacity per line, extended out across HOLDOUT_FORECAST_YEARS.
+
+    Lines with calendar data for a given year use that year's actual
+    total; lines missing a year fall back to that line's overall
+    calendar total as a stand-in estimate.
+    """
     df = calendar_df.copy()
     df["oee"] = df["line"].map(oee_by_line)
 
